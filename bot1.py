@@ -1,2832 +1,998 @@
-# ============================================================
-# ⚡ KRUTIK CYBER EXPERT — ULTIMATE BOT HOSTING
-# ============================================================
-# Features:
-# - User management
-# - Project upload (.zip / .py)
-# - Project management
-# - Start / Stop / Restart
-# - Auto restart
-# - requirements.txt installation
-# - Logs
-# - Error logs
-# - Deployment records
-# - Version records
-# - Owner/Admin panel
-# - User block/unblock
-# - Project force control
-# - Statistics
-# - Broadcast
-# - File manager basics
-#
-# Removed by design:
-# ❌ Backup System
-# ❌ Resource Monitoring
-# ❌ Webhook/Polling Manager
-# ============================================================
 
 import os
+import re
 import sys
 import json
 import time
 import shutil
+import signal
 import sqlite3
-import zipfile
 import asyncio
+import zipfile
+import tempfile
 import subprocess
-from datetime import datetime
+from pathlib import Path
+from threading import Thread, Lock
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
-
 # ============================================================
-# CONFIGURATION
-# ============================================================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-# Telegram numeric Chat ID (Render Environment Variable se liya jayega)
-OWNER_CHAT_ID_RAW = os.getenv("OWNER_CHAT_ID", "").strip()
-try:
-    OWNER_CHAT_ID = int(OWNER_CHAT_ID_RAW) if OWNER_CHAT_ID_RAW else 0
-except ValueError:
-    OWNER_CHAT_ID = 0
-
-BASE_DIR = os.path.abspath(os.getcwd())
-
-DB_PATH = os.path.join(BASE_DIR, "hosting.db")
-
-PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
-
-LOGS_DIR = os.path.join(BASE_DIR, "logs")
-
-TEMP_DIR = os.path.join(BASE_DIR, "temp")
-
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024
-
-AUTO_RESTART = True
-
-MAX_RESTART_ATTEMPTS = 5
-
-
-# ============================================================
-# DIRECTORIES
+# ⚡ KRUTIK CYBER EXPERT — ULTIMATE BOT HOSTING
+# Render Web Service + Telegram polling
 # ============================================================
 
-os.makedirs(PROJECTS_DIR, exist_ok=True)
-os.makedirs(LOGS_DIR, exist_ok=True)
-os.makedirs(TEMP_DIR, exist_ok=True)
+BOT_TOKEN = "YAHAN_APNA_BOT_TOKEN_DALO"
+OWNER_CHAT_ID = 7272787842
 
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "hosting.db"
+PROJECTS_DIR = BASE_DIR / "projects"
+TEMP_DIR = BASE_DIR / "temp"
+LOGS_DIR = BASE_DIR / "logs"
 
-# ============================================================
-# DATABASE
-# ============================================================
+for d in (PROJECTS_DIR, TEMP_DIR, LOGS_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+app_web = Flask(__name__)
+processes = {}
+process_locks = {}
+global_lock = Lock()
+
+# -------------------- DATABASE --------------------
 
 def db():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
-
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    return con
 
 def init_db():
+    con = db()
+    cur = con.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        username TEXT,
+        joined_at INTEGER NOT NULL,
+        last_active INTEGER NOT NULL,
+        blocked INTEGER DEFAULT 0,
+        access INTEGER DEFAULT 0
+    );
 
-    connection = db()
-    cursor = connection.cursor()
+    CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        slug TEXT NOT NULL UNIQUE,
+        path TEXT NOT NULL,
+        startup_file TEXT,
+        status TEXT DEFAULT 'stopped',
+        auto_restart INTEGER DEFAULT 1,
+        current_version INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
 
-    # --------------------------------------------------------
-    # USERS
-    # --------------------------------------------------------
+    CREATE TABLE IF NOT EXISTS versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        version_no INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        note TEXT
+    );
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER UNIQUE,
-            name TEXT,
-            username TEXT,
-            joined_at TEXT,
-            last_active TEXT,
-            blocked INTEGER DEFAULT 0
-        )
+    CREATE TABLE IF NOT EXISTS deployments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        version_no INTEGER,
+        status TEXT,
+        error TEXT,
+        started_at INTEGER,
+        finished_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS activity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        project_id INTEGER,
+        action TEXT NOT NULL,
+        result TEXT,
+        details TEXT,
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
     """)
+    defaults = {
+        "maintenance": "0",
+        "max_projects_per_user": "10",
+        "log_retention": "5000",
+    }
+    for k, v in defaults.items():
+        cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+    con.commit()
+    con.close()
 
-    # --------------------------------------------------------
-    # PROJECTS
-    # --------------------------------------------------------
+def setting(key, default=None):
+    con = db()
+    row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    con.close()
+    return row["value"] if row else default
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS projects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT UNIQUE,
-            user_id INTEGER,
-            name TEXT,
-            path TEXT,
-            startup_file TEXT,
-            python_version TEXT,
-            status TEXT DEFAULT 'STOPPED',
-            current_version INTEGER DEFAULT 1,
-            created_at TEXT,
-            last_started TEXT,
-            last_stopped TEXT,
-            last_deployment TEXT,
-            restart_count INTEGER DEFAULT 0
-        )
-    """)
+def set_setting(key, value):
+    con = db()
+    con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+    con.commit()
+    con.close()
 
-    # --------------------------------------------------------
-    # DEPLOYMENTS
-    # --------------------------------------------------------
+def log_activity(user_id, action, result="OK", project_id=None, details=""):
+    con = db()
+    con.execute(
+        "INSERT INTO activity(user_id,project_id,action,result,details,created_at) VALUES(?,?,?,?,?,?)",
+        (user_id, project_id, action, result, details[:2000], int(time.time()))
+    )
+    con.commit()
+    con.close()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS deployments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT,
-            user_id INTEGER,
-            version INTEGER,
-            status TEXT,
-            started_at TEXT,
-            completed_at TEXT,
-            error TEXT
-        )
-    """)
+def upsert_user(tg_user):
+    now = int(time.time())
+    con = db()
+    con.execute("""
+        INSERT INTO users(user_id,name,username,joined_at,last_active)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            name=excluded.name,
+            username=excluded.username,
+            last_active=excluded.last_active
+    """, (tg_user.id, tg_user.full_name, tg_user.username, now, now))
+    con.commit()
+    con.close()
 
-    # --------------------------------------------------------
-    # VERSIONS
-    # --------------------------------------------------------
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS versions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT,
-            version INTEGER,
-            path TEXT,
-            created_at TEXT,
-            status TEXT
-        )
-    """)
-
-    # --------------------------------------------------------
-    # ACTIVITY
-    # --------------------------------------------------------
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS activity (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            project_id TEXT,
-            action TEXT,
-            result TEXT,
-            details TEXT,
-            created_at TEXT
-        )
-    """)
-
-    connection.commit()
-    connection.close()
-
-
-init_db()
-
-
-# ============================================================
-# RUNTIME PROCESS STORAGE
-# ============================================================
-
-running_processes = {}
-
-restart_tasks = {}
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def safe_name(name):
-
-    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-
-    result = ""
-
-    for char in name:
-
-        if char in allowed:
-            result += char
-
-    if not result:
-        result = "project"
-
-    return result[:50]
-
-
-def project_path(project_id):
-
-    return os.path.join(PROJECTS_DIR, project_id)
-
-
-def log_path(project_id):
-
-    return os.path.join(LOGS_DIR, f"{project_id}.log")
-
-
-def error_log_path(project_id):
-
-    return os.path.join(LOGS_DIR, f"{project_id}_error.log")
-
-
-def is_owner(user_id):
-
-    return user_id == OWNER_CHAT_ID
-
-
-def get_user(user_id):
-
-    connection = db()
-
-    row = connection.execute(
-        "SELECT * FROM users WHERE user_id = ?",
-        (user_id,)
-    ).fetchone()
-
-    connection.close()
-
+def get_user(uid):
+    con = db()
+    row = con.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    con.close()
     return row
 
+def owner(uid):
+    return uid == OWNER_CHAT_ID
 
-def is_blocked(user_id):
-
-    user = get_user(user_id)
-
-    if not user:
+def user_allowed(uid):
+    row = get_user(uid)
+    if not row:
         return False
+    return bool(row["access"]) and not bool(row["blocked"])
 
-    return bool(user["blocked"])
+def maintenance_on():
+    return setting("maintenance", "0") == "1"
 
+# -------------------- SAFE PATHS / HELPERS --------------------
 
-def register_user(user):
+def safe_slug(name):
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "-", name.strip()).strip("-").lower()
+    return s[:40] or "project"
 
-    connection = db()
+def unique_slug(name):
+    base = safe_slug(name)
+    slug = base
+    n = 2
+    con = db()
+    while con.execute("SELECT 1 FROM projects WHERE slug=?", (slug,)).fetchone():
+        slug = f"{base}-{n}"
+        n += 1
+    con.close()
+    return slug
 
-    existing = connection.execute(
-        "SELECT id FROM users WHERE user_id = ?",
-        (user.id,)
-    ).fetchone()
+def project_dir(project):
+    return Path(project["path"]).resolve()
 
-    if existing:
+def valid_project_path(p):
+    try:
+        return p.resolve().is_relative_to(PROJECTS_DIR.resolve())
+    except AttributeError:
+        return str(p.resolve()).startswith(str(PROJECTS_DIR.resolve()))
 
-        connection.execute("""
-            UPDATE users
-            SET name = ?,
-                username = ?,
-                last_active = ?
-            WHERE user_id = ?
-        """, (
-            user.full_name,
-            user.username or "",
-            now(),
-            user.id
-        ))
+def startup_candidates(path):
+    preferred = ["bot.py", "main.py", "app.py", "bot1.py", "run.py"]
+    for n in preferred:
+        if (path / n).is_file():
+            return n
+    py = sorted(path.glob("*.py"))
+    return py[0].name if py else None
 
-    else:
+def project_log_path(pid):
+    return LOGS_DIR / f"project_{pid}.log"
 
-        connection.execute("""
-            INSERT INTO users
-            (
-                user_id,
-                name,
-                username,
-                joined_at,
-                last_active
+def append_log(pid, text):
+    p = project_log_path(pid)
+    with p.open("a", encoding="utf-8", errors="replace") as f:
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+
+def clear_log(pid):
+    project_log_path(pid).write_text("", encoding="utf-8")
+
+def syntax_check(pyfile):
+    r = subprocess.run(
+        [sys.executable, "-m", "py_compile", str(pyfile)],
+        capture_output=True, text=True, timeout=60
+    )
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+def requirements_install(path):
+    req = path / "requirements.txt"
+    if not req.exists():
+        return True, "requirements.txt not found; skipped."
+    # NOTE: Render Web Service installs into the same runtime environment.
+    # For untrusted multi-user hosting, a separate sandbox/container is required.
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-r", str(req)],
+        cwd=str(path), capture_output=True, text=True, timeout=600
+    )
+    return r.returncode == 0, (r.stdout + "\n" + r.stderr)[-8000:]
+
+# -------------------- PROJECT PROCESS CONTROL --------------------
+
+def start_project_sync(pid):
+    con = db()
+    project = con.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    con.close()
+    if not project:
+        return False, "Project not found."
+
+    p = project_dir(project)
+    if not valid_project_path(p) or not p.exists():
+        return False, "Project path is invalid or missing."
+
+    lock = process_locks.setdefault(pid, Lock())
+    with lock:
+        old = processes.get(pid)
+        if old and old.poll() is None:
+            return True, "Already running."
+
+        startup = project["startup_file"] or startup_candidates(p)
+        if not startup:
+            return False, "No Python startup file found."
+
+        pyfile = p / startup
+        if not pyfile.exists():
+            return False, f"Startup file not found: {startup}"
+
+        ok, err = syntax_check(pyfile)
+        if not ok:
+            append_log(pid, "SYNTAX ERROR:\n" + err)
+            con = db()
+            con.execute("UPDATE projects SET status='failed',updated_at=? WHERE id=?", (int(time.time()), pid))
+            con.commit(); con.close()
+            return False, err[-4000:]
+
+        logf = project_log_path(pid)
+        lf = logf.open("a", encoding="utf-8")
+        lf.write(f"\n--- START {time.ctime()} ---\n")
+        lf.flush()
+
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, startup],
+                cwd=str(p),
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=os.environ.copy()
             )
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            user.id,
-            user.full_name,
-            user.username or "",
-            now(),
-            now()
-        ))
+        except Exception as e:
+            lf.close()
+            return False, str(e)
 
-    connection.commit()
-    connection.close()
+        processes[pid] = proc
+        con = db()
+        con.execute("UPDATE projects SET status='running',updated_at=? WHERE id=?", (int(time.time()), pid))
+        con.commit(); con.close()
+        return True, f"Started PID {proc.pid}"
 
+def stop_project_sync(pid):
+    lock = process_locks.setdefault(pid, Lock())
+    with lock:
+        proc = processes.get(pid)
+        if not proc or proc.poll() is not None:
+            processes.pop(pid, None)
+            con = db()
+            con.execute("UPDATE projects SET status='stopped',updated_at=? WHERE id=?", (int(time.time()), pid))
+            con.commit(); con.close()
+            return True, "Already stopped."
 
-def add_activity(
-    user_id,
-    action,
-    result="OK",
-    project_id=None,
-    details=""
-):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception as e:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            append_log(pid, "STOP ERROR: " + str(e))
 
-    connection = db()
+        processes.pop(pid, None)
+        con = db()
+        con.execute("UPDATE projects SET status='stopped',updated_at=? WHERE id=?", (int(time.time()), pid))
+        con.commit(); con.close()
+        return True, "Stopped."
 
-    connection.execute("""
-        INSERT INTO activity
-        (
-            user_id,
-            project_id,
-            action,
-            result,
-            details,
-            created_at
+def monitor_processes():
+    while True:
+        try:
+            con = db()
+            rows = con.execute("SELECT * FROM projects WHERE status='running'").fetchall()
+            con.close()
+            for row in rows:
+                pid = row["id"]
+                proc = processes.get(pid)
+                if proc and proc.poll() is not None:
+                    code = proc.returncode
+                    append_log(pid, f"\n--- PROCESS EXITED code={code} {time.ctime()} ---\n")
+                    processes.pop(pid, None)
+                    con = db()
+                    con.execute("UPDATE projects SET status='failed',updated_at=? WHERE id=?", (int(time.time()), pid))
+                    con.commit(); con.close()
+                    if row["auto_restart"]:
+                        time.sleep(2)
+                        start_project_sync(pid)
+        except Exception:
+            pass
+        time.sleep(5)
+
+# -------------------- DEPLOYMENT --------------------
+
+def create_version_from_current(pid, note=""):
+    con = db()
+    project = con.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    if not project:
+        con.close()
+        return None
+    p = project_dir(project)
+    version_no = int(project["current_version"]) + 1
+    vdir = p / ".versions" / f"v{version_no}"
+    vdir.parent.mkdir(parents=True, exist_ok=True)
+    if vdir.exists():
+        shutil.rmtree(vdir)
+    shutil.copytree(p, vdir, ignore=shutil.ignore_patterns(".versions"))
+    con.execute(
+        "INSERT INTO versions(project_id,version_no,path,created_at,note) VALUES(?,?,?,?,?)",
+        (pid, version_no, str(vdir), int(time.time()), note[:500])
+    )
+    con.execute(
+        "UPDATE projects SET current_version=?,updated_at=? WHERE id=?",
+        (version_no, int(time.time()), pid)
+    )
+    con.commit(); con.close()
+    return version_no
+
+def deploy_path(pid, staging):
+    con = db()
+    project = con.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    con.close()
+    if not project:
+        return False, "Project not found."
+
+    p = project_dir(project)
+    staging = Path(staging).resolve()
+    if not staging.exists():
+        return False, "Staging directory missing."
+
+    startup = startup_candidates(staging)
+    if not startup:
+        return False, "No .py startup file found in upload."
+
+    ok, err = syntax_check(staging / startup)
+    if not ok:
+        return False, "Syntax check failed:\n" + err[-5000:]
+
+    ok, reqout = requirements_install(staging)
+    if not ok:
+        return False, "requirements.txt installation failed:\n" + reqout[-6000:]
+
+    was_running = processes.get(pid)
+    running_before = bool(was_running and was_running.poll() is None)
+    if running_before:
+        stop_project_sync(pid)
+
+    # Preserve current tree as a version before replacement.
+    create_version_from_current(pid, "pre-deploy snapshot")
+
+    tmp_old = p.parent / (p.name + ".old")
+    if tmp_old.exists():
+        shutil.rmtree(tmp_old, ignore_errors=True)
+
+    # Keep .versions outside the uploaded staging content.
+    versions_dir = p / ".versions"
+    if versions_dir.exists():
+        saved_versions = tempfile.mkdtemp(dir=str(p.parent))
+        shutil.move(str(versions_dir), str(Path(saved_versions) / ".versions"))
+    else:
+        saved_versions = None
+
+    try:
+        shutil.move(str(p), str(tmp_old))
+        shutil.move(str(staging), str(p))
+        if saved_versions:
+            shutil.move(str(Path(saved_versions) / ".versions"), str(p / ".versions"))
+            shutil.rmtree(saved_versions, ignore_errors=True)
+        shutil.rmtree(tmp_old, ignore_errors=True)
+
+        con = db()
+        con.execute(
+            "UPDATE projects SET startup_file=?,status='stopped',updated_at=? WHERE id=?",
+            (startup, int(time.time()), pid)
         )
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        project_id,
-        action,
-        result,
-        details,
-        now()
-    ))
+        con.commit(); con.close()
+        if running_before:
+            start_project_sync(pid)
+        return True, "Deployment successful."
+    except Exception as e:
+        # Best-effort rollback to old tree.
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+        if tmp_old.exists():
+            shutil.move(str(tmp_old), str(p))
+        return False, "Deployment replacement failed: " + str(e)
 
-    connection.commit()
-    connection.close()
-
-
-def get_project(project_id):
-
-    connection = db()
-
-    row = connection.execute(
-        "SELECT * FROM projects WHERE project_id = ?",
-        (project_id,)
-    ).fetchone()
-
-    connection.close()
-
-    return row
-
-
-def user_projects(user_id):
-
-    connection = db()
-
-    rows = connection.execute("""
-        SELECT *
-        FROM projects
-        WHERE user_id = ?
-        ORDER BY id DESC
-    """, (user_id,)).fetchall()
-
-    connection.close()
-
-    return rows
-
-
-# ============================================================
-# USER MENU
-# ============================================================
+# -------------------- TELEGRAM UI --------------------
 
 def main_menu():
-
     return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "➕ New Project",
-                callback_data="new_project"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🤖 My Projects",
-                callback_data="my_projects"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📊 Statistics",
-                callback_data="my_stats"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📜 Activity",
-                callback_data="my_activity"
-            )
-        ],
-
+        [InlineKeyboardButton("📦 My Projects", callback_data="projects"),
+         InlineKeyboardButton("➕ New Project", callback_data="newproject")],
+        [InlineKeyboardButton("📊 My Stats", callback_data="mystats"),
+         InlineKeyboardButton("ℹ️ Help", callback_data="help")]
     ])
-
-
-# ============================================================
-# OWNER MENU
-# ============================================================
 
 def owner_menu():
-
     return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "📊 Dashboard",
-                callback_data="admin_dashboard"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "👥 Users",
-                callback_data="admin_users"
-            ),
-
-            InlineKeyboardButton(
-                "📦 Projects",
-                callback_data="admin_projects"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🚀 Deployments",
-                callback_data="admin_deployments"
-            ),
-
-            InlineKeyboardButton(
-                "📜 Logs",
-                callback_data="admin_logs"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔄 Versions",
-                callback_data="admin_versions"
-            ),
-
-            InlineKeyboardButton(
-                "📈 Statistics",
-                callback_data="admin_stats"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📢 Broadcast",
-                callback_data="admin_broadcast"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⚙️ Hosting Settings",
-                callback_data="admin_settings"
-            )
-        ],
-
+        [InlineKeyboardButton("📊 Dashboard", callback_data="adashboard"),
+         InlineKeyboardButton("👥 Users", callback_data="ausers")],
+        [InlineKeyboardButton("📦 All Projects", callback_data="aprojects"),
+         InlineKeyboardButton("🚀 Deployments", callback_data="adeployments")],
+        [InlineKeyboardButton("📜 Activity", callback_data="aactivity"),
+         InlineKeyboardButton("⚙️ Settings", callback_data="asettings")],
+        [InlineKeyboardButton("🛠 Maintenance", callback_data="amaint"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="abroadcast")]
     ])
 
+async def deny(update, text):
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text)
 
-# ============================================================
-# /START
-# ============================================================
+async def ensure_user(update):
+    u = update.effective_user
+    upsert_user(u)
+    row = get_user(u.id)
+    if row and row["blocked"]:
+        await deny(update, "🚫 You are blocked by owner.")
+        return False
+    if owner(u.id):
+        return True
+    if maintenance_on():
+        await deny(update, "🛠 Hosting is in maintenance mode.")
+        return False
+    if not row or not row["access"]:
+        await deny(update, "⛔ Access not granted yet.\nYour Chat ID: " + str(u.id))
+        return False
+    return True
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-
-    register_user(user)
-
-    if is_blocked(user.id) and not is_owner(user.id):
-
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update.effective_user)
+    u = update.effective_user
+    row = get_user(u.id)
+    if owner(u.id):
         await update.message.reply_text(
-            "🚫 You are blocked from using this hosting service."
-        )
-
-        return
-
-    add_activity(
-        user.id,
-        "START",
-        "OK"
-    )
-
-    if is_owner(user.id):
-
-        await update.message.reply_text(
-            "👑 KRUTIK CYBER EXPERT\n\n"
-            "⚡ ULTIMATE BOT HOSTING\n\n"
-            "Welcome Owner.\n"
-            "Use the Admin Panel below.",
+            "⚡ KRUTIK CYBER EXPERT — ULTIMATE BOT HOSTING\n\n"
+            "👑 Owner Panel ready.",
             reply_markup=owner_menu()
         )
-
         return
-
     await update.message.reply_text(
-        "⚡ KRUTIK CYBER EXPERT\n\n"
-        "☁️ ULTIMATE BOT HOSTING\n\n"
-        "Welcome!\n\n"
-        "Upload your Python project and manage it directly from Telegram.",
-        reply_markup=main_menu()
+        "⚡ KRUTIK CYBER EXPERT — ULTIMATE BOT HOSTING\n\n"
+        f"👤 Name: {u.full_name}\n"
+        f"🔹 Username: @{u.username}" if u.username else
+        f"👤 Name: {u.full_name}",
     )
-
-
-# ============================================================
-# NEW PROJECT
-# ============================================================
-
-async def new_project_start(update, context):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    if is_blocked(user_id):
-
-        await query.edit_message_text(
-            "🚫 You are blocked."
-        )
-
-        return
-
-    context.user_data["creating_project"] = True
-
-    await query.edit_message_text(
-        "➕ CREATE PROJECT\n\n"
-        "Send your project as:\n\n"
-        "📦 ZIP file\n"
-        "📄 Python file\n\n"
-        "Example:\n"
-        "mybot.zip\n\n"
-        "The project will be created automatically."
-    )
-
-
-# ============================================================
-# FILE UPLOAD
-# ============================================================
-
-async def handle_document(update, context):
-
-    user = update.effective_user
-
-    register_user(user)
-
-    if is_blocked(user.id) and not is_owner(user.id):
-
-        await update.message.reply_text(
-            "🚫 You are blocked."
-        )
-
-        return
-
-    document = update.message.document
-
-    if not document:
-
-        return
-
-    file_name = document.file_name or "project"
-
-    if document.file_size:
-
-        if document.file_size > MAX_UPLOAD_SIZE:
-
-            await update.message.reply_text(
-                "❌ File is too large."
-            )
-
-            return
-
-    # --------------------------------------------------------
-    # Require project creation mode
-    # --------------------------------------------------------
-
-    if not context.user_data.get("creating_project"):
-
-        await update.message.reply_text(
-            "ℹ️ First press ➕ New Project."
-        )
-
-        return
-
-    project_name = os.path.splitext(file_name)[0]
-
-    project_name = safe_name(project_name)
-
-    project_id = (
-        f"{user.id}_"
-        f"{int(time.time())}"
-    )
-
-    destination = project_path(project_id)
-
-    os.makedirs(destination, exist_ok=True)
-
-    temp_file = os.path.join(
-        TEMP_DIR,
-        f"{project_id}_{file_name}"
-    )
-
-    try:
-
-        await update.message.reply_text(
-            "📥 Downloading project..."
-        )
-
-        telegram_file = await document.get_file()
-
-        await telegram_file.download_to_drive(
-            temp_file
-        )
-
-        await update.message.reply_text(
-            "📦 Processing project..."
-        )
-
-        # ----------------------------------------------------
-        # ZIP
-        # ----------------------------------------------------
-
-        if file_name.lower().endswith(".zip"):
-
-            with zipfile.ZipFile(
-                temp_file,
-                "r"
-            ) as archive:
-
-                archive.extractall(
-                    destination
-                )
-
-        # ----------------------------------------------------
-        # PYTHON
-        # ----------------------------------------------------
-
-        elif file_name.lower().endswith(".py"):
-
-            shutil.copy(
-                temp_file,
-                os.path.join(
-                    destination,
-                    file_name
-                )
-            )
-
-        else:
-
-            os.remove(temp_file)
-
-            shutil.rmtree(
-                destination,
-                ignore_errors=True
-            )
-
-            await update.message.reply_text(
-                "❌ Supported files:\n\n"
-                "📦 ZIP\n"
-                "📄 PY"
-            )
-
-            return
-
-        os.remove(temp_file)
-
-        # ----------------------------------------------------
-        # Find startup file
-        # ----------------------------------------------------
-
-        startup = find_startup_file(
-            destination
-        )
-
-        if not startup:
-
-            await update.message.reply_text(
-                "⚠️ Project uploaded but no Python startup file was found.\n\n"
-                "Create a .py file and use project settings."
-            )
-
-            startup = ""
-
-        connection = db()
-
-        connection.execute("""
-            INSERT INTO projects
-            (
-                project_id,
-                user_id,
-                name,
-                path,
-                startup_file,
-                python_version,
-                status,
-                current_version,
-                created_at,
-                last_deployment
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            project_id,
-            user.id,
-            project_name,
-            destination,
-            startup,
-            f"{sys.version_info.major}.{sys.version_info.minor}",
-            "STOPPED",
-            1,
-            now(),
-            now()
-        ))
-
-        connection.execute("""
-            INSERT INTO versions
-            (
-                project_id,
-                version,
-                path,
-                created_at,
-                status
-            )
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            project_id,
-            1,
-            destination,
-            now(),
-            "CURRENT"
-        ))
-
-        connection.execute("""
-            INSERT INTO deployments
-            (
-                project_id,
-                user_id,
-                version,
-                status,
-                started_at,
-                completed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            project_id,
-            user.id,
-            1,
-            "SUCCESS",
-            now(),
-            now()
-        ))
-
-        connection.commit()
-        connection.close()
-
-        add_activity(
-            user.id,
-            "PROJECT_CREATED",
-            "SUCCESS",
-            project_id,
-            project_name
-        )
-
-        context.user_data["creating_project"] = False
-
-        await update.message.reply_text(
-            "✅ PROJECT CREATED\n\n"
-            f"📦 Name: {project_name}\n"
-            f"🆔 ID: {project_id}\n"
-            f"🐍 Startup: {startup or 'Not found'}\n"
-            f"🔢 Version: 1\n\n"
-            "Use My Projects to manage it.",
-            reply_markup=main_menu()
-        )
-
-    except Exception as e:
-
-        try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        except Exception:
-            pass
-
-        shutil.rmtree(
-            destination,
-            ignore_errors=True
-        )
-
-        await update.message.reply_text(
-            f"❌ Project creation failed.\n\n"
-            f"Error: {str(e)[:1500]}"
-        )
-
-
-# ============================================================
-# FIND STARTUP FILE
-# ============================================================
-
-def find_startup_file(path):
-
-    priority = [
-        "bot.py",
-        "main.py",
-        "app.py",
-        "run.py",
-        "server.py"
-    ]
-
-    for file in priority:
-
-        full = os.path.join(
-            path,
-            file
-        )
-
-        if os.path.isfile(full):
-
-            return file
-
-    for root, dirs, files in os.walk(path):
-
-        for file in files:
-
-            if file.endswith(".py"):
-
-                relative = os.path.relpath(
-                    os.path.join(root, file),
-                    path
-                )
-
-                return relative
-
-    return None
-
-
-# ============================================================
-# PROJECT LIST
-# ============================================================
-
-async def my_projects(update, context):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    rows = user_projects(user_id)
-
-    if not rows:
-
-        await query.edit_message_text(
-            "📦 MY PROJECTS\n\n"
-            "No projects found.",
-            reply_markup=main_menu()
-        )
-
-        return
-
-    buttons = []
-
-    for row in rows:
-
-        status = row["status"]
-
-        icon = "🟢" if status == "RUNNING" else "🔴"
-
-        buttons.append([
-
-            InlineKeyboardButton(
-                f"{icon} {row['name']}",
-                callback_data=f"project:{row['project_id']}"
-            )
-
-        ])
-
-    buttons.append([
-
-        InlineKeyboardButton(
-            "🔙 Back",
-            callback_data="back_main"
-        )
-
-    ])
-
-    await query.edit_message_text(
-        "📦 MY PROJECTS",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-# ============================================================
-# PROJECT DETAILS
-# ============================================================
-
-async def project_details(update, context):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    project_id = query.data.split(":", 1)[1]
-
-    project = get_project(project_id)
-
-    if not project:
-
-        await query.edit_message_text(
-            "❌ Project not found."
-        )
-
-        return
-
-    if (
-        project["user_id"] != query.from_user.id
-        and not is_owner(query.from_user.id)
-    ):
-
-        await query.edit_message_text(
-            "🚫 Access denied."
-        )
-
-        return
-
-    status = project["status"]
-
-    buttons = []
-
-    if status == "RUNNING":
-
-        buttons.append([
-
-            InlineKeyboardButton(
-                "⏹️ Stop",
-                callback_data=f"stop:{project_id}"
-            ),
-
-            InlineKeyboardButton(
-                "🔄 Restart",
-                callback_data=f"restart:{project_id}"
-            )
-
-        ])
-
-    else:
-
-        buttons.append([
-
-            InlineKeyboardButton(
-                "▶️ Start",
-                callback_data=f"startbot:{project_id}"
-            )
-
-        ])
-
-    buttons.append([
-
-        InlineKeyboardButton(
-            "📜 Logs",
-            callback_data=f"logs:{project_id}"
-        ),
-
-        InlineKeyboardButton(
-            "❌ Errors",
-            callback_data=f"errors:{project_id}"
-        )
-
-    ])
-
-    buttons.append([
-
-        InlineKeyboardButton(
-            "📦 Deploy",
-            callback_data=f"deploy:{project_id}"
-        ),
-
-        InlineKeyboardButton(
-            "🔄 Versions",
-            callback_data=f"versions:{project_id}"
-        )
-
-    ])
-
-    buttons.append([
-
-        InlineKeyboardButton(
-            "🗑️ Delete",
-            callback_data=f"delete_confirm:{project_id}"
-        )
-
-    ])
-
-    buttons.append([
-
-        InlineKeyboardButton(
-            "🔙 Back",
-            callback_data="my_projects"
-        )
-
-    ])
-
-    await query.edit_message_text(
-        f"📦 PROJECT\n\n"
-        f"Name: {project['name']}\n"
-        f"ID: {project['project_id']}\n"
-        f"Status: {status}\n"
-        f"Startup: {project['startup_file'] or 'Not set'}\n"
-        f"Version: {project['current_version']}\n"
-        f"Created: {project['created_at']}\n"
-        f"Restarts: {project['restart_count']}",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-# ============================================================
-# INSTALL REQUIREMENTS
-# ============================================================
-
-async def install_requirements(path, project_id):
-
-    requirements = os.path.join(
-        path,
-        "requirements.txt"
-    )
-
-    if not os.path.isfile(requirements):
-
-        return True, "requirements.txt not found."
-
-    log_file = log_path(project_id)
-
-    try:
-
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            requirements,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=path
-        )
-
-        output = []
-
-        while True:
-
-            line = await process.stdout.readline()
-
-            if not line:
-                break
-
-            text = line.decode(
-                errors="ignore"
-            )
-
-            output.append(text)
-
-            with open(
-                log_file,
-                "a",
-                encoding="utf-8"
-            ) as f:
-
-                f.write(text)
-
-        code = await process.wait()
-
-        if code == 0:
-
-            return True, "".join(output)
-
-        return False, "".join(output)
-
-    except Exception as e:
-
-        return False, str(e)
-
-
-# ============================================================
-# START PROJECT
-# ============================================================
-
-async def start_project(project_id, user_id):
-
-    project = get_project(project_id)
-
-    if not project:
-        return False, "Project not found."
-
-    if (
-        project["user_id"] != user_id
-        and not is_owner(user_id)
-    ):
-
-        return False, "Access denied."
-
-    if project_id in running_processes:
-
-        return False, "Project is already running."
-
-    path = project["path"]
-
-    startup = project["startup_file"]
-
-    if not startup:
-
-        startup = find_startup_file(path)
-
-    if not startup:
-
-        return False, "No Python startup file found."
-
-    startup_path = os.path.join(
-        path,
-        startup
-    )
-
-    if not os.path.isfile(startup_path):
-
-        return False, "Startup file does not exist."
-
-    # --------------------------------------------------------
-    # Requirements
-    # --------------------------------------------------------
-
-    success, output = await install_requirements(
-        path,
-        project_id
-    )
-
-    if not success:
-
-        return False, (
-            "Dependency installation failed.\n\n"
-            + output[-3000:]
-        )
-
-    log_file = log_path(project_id)
-
-    error_file = error_log_path(project_id)
-
-    log_handle = open(
-        log_file,
-        "a",
-        encoding="utf-8"
-    )
-
-    error_handle = open(
-        error_file,
-        "a",
-        encoding="utf-8"
-    )
-
-    log_handle.write(
-        f"\n\n===== START {now()} =====\n"
-    )
-
-    try:
-
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                startup_path
-            ],
-            cwd=path,
-            stdout=log_handle,
-            stderr=error_handle
-        )
-
-    except Exception as e:
-
-        log_handle.close()
-        error_handle.close()
-
-        return False, str(e)
-
-    running_processes[project_id] = {
-        "process": process,
-        "log_handle": log_handle,
-        "error_handle": error_handle,
-        "user_id": project["user_id"],
-        "restart_attempts": 0
-    }
-
-    connection = db()
-
-    connection.execute("""
-        UPDATE projects
-        SET status = 'RUNNING',
-            last_started = ?
-        WHERE project_id = ?
-    """, (
-        now(),
-        project_id
-    ))
-
-    connection.commit()
-    connection.close()
-
-    add_activity(
-        user_id,
-        "START",
-        "SUCCESS",
-        project_id
-    )
-
-    if project_id not in restart_tasks:
-
-        restart_tasks[project_id] = asyncio.create_task(
-            monitor_process(project_id)
-        )
-
-    return True, "Project started successfully."
-
-
-# ============================================================
-# PROCESS MONITOR
-# ============================================================
-
-async def monitor_process(project_id):
-
-    while project_id in running_processes:
-
-        data = running_processes.get(project_id)
-
-        if not data:
-
-            break
-
-        process = data["process"]
-
-        return_code = process.poll()
-
-        if return_code is None:
-
-            await asyncio.sleep(3)
-
-            continue
-
-        try:
-            data["log_handle"].close()
-        except Exception:
-            pass
-
-        try:
-            data["error_handle"].close()
-        except Exception:
-            pass
-
-        user_id = data["user_id"]
-
-        attempts = data["restart_attempts"]
-
-        running_processes.pop(
-            project_id,
-            None
-        )
-
-        connection = db()
-
-        connection.execute("""
-            UPDATE projects
-            SET status = 'STOPPED',
-                last_stopped = ?,
-                restart_count = restart_count + 1
-            WHERE project_id = ?
-        """, (
-            now(),
-            project_id
-        ))
-
-        connection.commit()
-        connection.close()
-
-        # ----------------------------------------------------
-        # AUTO RESTART
-        # ----------------------------------------------------
-
-        if AUTO_RESTART and attempts < MAX_RESTART_ATTEMPTS:
-
-            await asyncio.sleep(3)
-
-            project = get_project(project_id)
-
-            if project:
-
-                ok, message = await start_project(
-                    project_id,
-                    user_id
-                )
-
-                if ok:
-
-                    if project_id in running_processes:
-
-                        running_processes[
-                            project_id
-                        ][
-                            "restart_attempts"
-                        ] = attempts + 1
-
-                else:
-
-                    await notify_user(
-                        user_id,
-                        f"❌ {project['name']} crashed.\n\n"
-                        f"♻️ Auto-restart failed.\n\n"
-                        f"{message[:1000]}"
-                    )
-
-        else:
-
-            await notify_user(
-                user_id,
-                "❌ Your project stopped.\n\n"
-                f"🔄 Restart attempts reached the limit."
-            )
-
-        break
-
-
-# ============================================================
-# NOTIFY USER
-# ============================================================
-
-async def notify_user(user_id, text):
-
-    try:
-
-        application = CURRENT_APPLICATION
-
-        if application:
-
-            await application.bot.send_message(
-                chat_id=user_id,
-                text=text
-            )
-
-    except Exception:
-        pass
-
-
-CURRENT_APPLICATION = None
-
-
-# ============================================================
-# STOP PROJECT
-# ============================================================
-
-async def stop_project(project_id, user_id):
-
-    project = get_project(project_id)
-
-    if not project:
-
-        return False, "Project not found."
-
-    if (
-        project["user_id"] != user_id
-        and not is_owner(user_id)
-    ):
-
-        return False, "Access denied."
-
-    data = running_processes.get(project_id)
-
-    if not data:
-
-        connection = db()
-
-        connection.execute("""
-            UPDATE projects
-            SET status = 'STOPPED',
-                last_stopped = ?
-            WHERE project_id = ?
-        """, (
-            now(),
-            project_id
-        ))
-
-        connection.commit()
-        connection.close()
-
-        return True, "Project already stopped."
-
-    process = data["process"]
-
-    try:
-
-        process.terminate()
-
-        try:
-
-            process.wait(timeout=5)
-
-        except subprocess.TimeoutExpired:
-
-            process.kill()
-
-    except Exception as e:
-
-        return False, str(e)
-
-    try:
-        data["log_handle"].close()
-    except Exception:
-        pass
-
-    try:
-        data["error_handle"].close()
-    except Exception:
-        pass
-
-    running_processes.pop(
-        project_id,
-        None
-    )
-
-    connection = db()
-
-    connection.execute("""
-        UPDATE projects
-        SET status = 'STOPPED',
-            last_stopped = ?
-        WHERE project_id = ?
-    """, (
-        now(),
-        project_id
-    ))
-
-    connection.commit()
-    connection.close()
-
-    add_activity(
-        user_id,
-        "STOP",
-        "SUCCESS",
-        project_id
-    )
-
-    return True, "Project stopped successfully."
-
-
-# ============================================================
-# RESTART
-# ============================================================
-
-async def restart_project(project_id, user_id):
-
-    ok, message = await stop_project(
-        project_id,
-        user_id
-    )
-
-    if not ok:
-
-        return False, message
-
-    await asyncio.sleep(1)
-
-    return await start_project(
-        project_id,
-        user_id
-    )
-
-
-# ============================================================
-# DELETE PROJECT
-# ============================================================
-
-async def delete_project(project_id, user_id):
-
-    project = get_project(project_id)
-
-    if not project:
-
-        return False, "Project not found."
-
-    if (
-        project["user_id"] != user_id
-        and not is_owner(user_id)
-    ):
-
-        return False, "Access denied."
-
-    await stop_project(
-        project_id,
-        user_id
-    )
-
-    path = project["path"]
-
-    try:
-
-        if os.path.exists(path):
-
-            shutil.rmtree(path)
-
-        log = log_path(project_id)
-
-        error = error_log_path(project_id)
-
-        if os.path.exists(log):
-            os.remove(log)
-
-        if os.path.exists(error):
-            os.remove(error)
-
-    except Exception as e:
-
-        return False, str(e)
-
-    connection = db()
-
-    connection.execute(
-        "DELETE FROM versions WHERE project_id = ?",
-        (project_id,)
-    )
-
-    connection.execute(
-        "DELETE FROM deployments WHERE project_id = ?",
-        (project_id,)
-    )
-
-    connection.execute(
-        "DELETE FROM activity WHERE project_id = ?",
-        (project_id,)
-    )
-
-    connection.execute(
-        "DELETE FROM projects WHERE project_id = ?",
-        (project_id,)
-    )
-
-    connection.commit()
-    connection.close()
-
-    add_activity(
-        user_id,
-        "DELETE_PROJECT",
-        "SUCCESS",
-        project_id
-    )
-
-    return True, "Project deleted successfully."
-
-
-# ============================================================
-# LOGS
-# ============================================================
-
-def read_log(project_id, error=False):
-
-    path = (
-        error_log_path(project_id)
-        if error
-        else log_path(project_id)
-    )
-
-    if not os.path.isfile(path):
-
-        return "No logs available."
-
-    try:
-
-        with open(
-            path,
-            "r",
-            encoding="utf-8",
-            errors="ignore"
-        ) as f:
-
-            content = f.read()
-
-        return content[-7000:]
-
-    except Exception as e:
-
-        return str(e)
-
-
-# ============================================================
-# VERSIONS
-# ============================================================
-
-def get_versions(project_id):
-
-    connection = db()
-
-    rows = connection.execute("""
-        SELECT *
-        FROM versions
-        WHERE project_id = ?
-        ORDER BY version DESC
-    """, (project_id,)).fetchall()
-
-    connection.close()
-
-    return rows
-
-
-# ============================================================
-# DEPLOY PROJECT
-# ============================================================
-
-async def deploy_project(project_id, user_id):
-
-    project = get_project(project_id)
-
-    if not project:
-
-        return False, "Project not found."
-
-    if (
-        project["user_id"] != user_id
-        and not is_owner(user_id)
-    ):
-
-        return False, "Access denied."
-
-    new_version = project["current_version"] + 1
-
-    connection = db()
-
-    connection.execute("""
-        INSERT INTO deployments
-        (
-            project_id,
-            user_id,
-            version,
-            status,
-            started_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        project_id,
-        project["user_id"],
-        new_version,
-        "RUNNING",
-        now()
-    ))
-
-    connection.commit()
-
-    connection.execute("""
-        UPDATE projects
-        SET current_version = ?,
-            last_deployment = ?
-        WHERE project_id = ?
-    """, (
-        new_version,
-        now(),
-        project_id
-    ))
-
-    connection.execute("""
-        INSERT INTO versions
-        (
-            project_id,
-            version,
-            path,
-            created_at,
-            status
-        )
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        project_id,
-        new_version,
-        project["path"],
-        now(),
-        "CURRENT"
-    ))
-
-    connection.execute("""
-        UPDATE versions
-        SET status = 'OLD'
-        WHERE project_id = ?
-        AND version != ?
-    """, (
-        project_id,
-        new_version
-    ))
-
-    connection.execute("""
-        UPDATE deployments
-        SET status = 'SUCCESS',
-            completed_at = ?
-        WHERE project_id = ?
-        AND version = ?
-    """, (
-        now(),
-        project_id,
-        new_version
-    ))
-
-    connection.commit()
-    connection.close()
-
-    add_activity(
-        user_id,
-        "DEPLOY",
-        "SUCCESS",
-        project_id,
-        f"Version {new_version}"
-    )
-
-    return True, f"Deployment successful. Version {new_version}"
-
-
-# ============================================================
-# CALLBACK HANDLER
-# ============================================================
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-
-    data = query.data
-
-    user_id = query.from_user.id
-
-    await query.answer()
-
-    # --------------------------------------------------------
-    # USER MENU
-    # --------------------------------------------------------
-
-    if data == "new_project":
-
-        await new_project_start(
-            update,
-            context
-        )
-
-        return
-
-    if data == "my_projects":
-
-        await my_projects(
-            update,
-            context
-        )
-
-        return
-
-    if data == "my_stats":
-
-        await show_my_stats(
-            update,
-            context
-        )
-
-        return
-
-    if data == "my_activity":
-
-        await show_my_activity(
-            update,
-            context
-        )
-
-        return
-
-    if data == "back_main":
-
-        await query.edit_message_text(
-            "⚡ KRUTIK CYBER EXPERT\n\n"
-            "☁️ ULTIMATE BOT HOSTING",
-            reply_markup=main_menu()
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # PROJECT
-    # --------------------------------------------------------
-
-    if data.startswith("project:"):
-
-        await project_details(
-            update,
-            context
-        )
-
-        return
-
-    if data.startswith("startbot:"):
-
-        project_id = data.split(":", 1)[1]
-
-        ok, message = await start_project(
-            project_id,
-            user_id
-        )
-
-        await query.answer(
-            message,
-            show_alert=True
-        )
-
-        await project_details(
-            update,
-            context
-        )
-
-        return
-
-    if data.startswith("stop:"):
-
-        project_id = data.split(":", 1)[1]
-
-        ok, message = await stop_project(
-            project_id,
-            user_id
-        )
-
-        await query.answer(
-            message,
-            show_alert=True
-        )
-
-        await project_details(
-            update,
-            context
-        )
-
-        return
-
-    if data.startswith("restart:"):
-
-        project_id = data.split(":", 1)[1]
-
-        ok, message = await restart_project(
-            project_id,
-            user_id
-        )
-
-        await query.answer(
-            message,
-            show_alert=True
-        )
-
-        await project_details(
-            update,
-            context
-        )
-
-        return
-
-    if data.startswith("logs:"):
-
-        project_id = data.split(":", 1)[1]
-
-        project = get_project(project_id)
-
-        if not project:
-
-            await query.edit_message_text(
-                "❌ Project not found."
-            )
-
-            return
-
-        if (
-            project["user_id"] != user_id
-            and not is_owner(user_id)
-        ):
-
-            await query.edit_message_text(
-                "🚫 Access denied."
-            )
-
-            return
-
-        logs = read_log(project_id)
-
-        await query.edit_message_text(
-            f"📜 LOGS — {project['name']}\n\n"
-            f"<pre>{escape_html(logs[-6500:])}</pre>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Back",
-                        callback_data=f"project:{project_id}"
-                    )
-                ]
-            ])
-        )
-
-        return
-
-    if data.startswith("errors:"):
-
-        project_id = data.split(":", 1)[1]
-
-        project = get_project(project_id)
-
-        if not project:
-
-            await query.edit_message_text(
-                "❌ Project not found."
-            )
-
-            return
-
-        errors = read_log(
-            project_id,
-            error=True
-        )
-
-        await query.edit_message_text(
-            f"❌ ERROR LOG — {project['name']}\n\n"
-            f"<pre>{escape_html(errors[-6500:])}</pre>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Back",
-                        callback_data=f"project:{project_id}"
-                    )
-                ]
-            ])
-        )
-
-        return
-
-    if data.startswith("deploy:"):
-
-        project_id = data.split(":", 1)[1]
-
-        ok, message = await deploy_project(
-            project_id,
-            user_id
-        )
-
-        await query.answer(
-            message,
-            show_alert=True
-        )
-
-        await project_details(
-            update,
-            context
-        )
-
-        return
-
-    if data.startswith("versions:"):
-
-        await show_versions(
-            update,
-            context
-        )
-
-        return
-
-    if data.startswith("delete_confirm:"):
-
-        project_id = data.split(":", 1)[1]
-
-        await query.edit_message_text(
-            "⚠️ DELETE PROJECT?\n\n"
-            "This will delete the project files and records.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🗑️ YES DELETE",
-                        callback_data=f"delete:{project_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data=f"project:{project_id}"
-                    )
-                ]
-            ])
-        )
-
-        return
-
-    if data.startswith("delete:"):
-
-        project_id = data.split(":", 1)[1]
-
-        ok, message = await delete_project(
-            project_id,
-            user_id
-        )
-
-        await query.answer(
-            message,
-            show_alert=True
-        )
-
-        await my_projects(
-            update,
-            context
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ADMIN
-    # --------------------------------------------------------
-
-    if data.startswith("admin_"):
-
-        if not is_owner(user_id):
-
-            await query.answer(
-                "🚫 Owner only.",
-                show_alert=True
-            )
-
-            return
-
-        if data == "admin_dashboard":
-
-            await admin_dashboard(
-                update,
-                context
-            )
-
-        elif data == "admin_users":
-
-            await admin_users(
-                update,
-                context
-            )
-
-        elif data == "admin_projects":
-
-            await admin_projects(
-                update,
-                context
-            )
-
-        elif data == "admin_deployments":
-
-            await admin_deployments(
-                update,
-                context
-            )
-
-        elif data == "admin_logs":
-
-            await admin_logs(
-                update,
-                context
-            )
-
-        elif data == "admin_versions":
-
-            await admin_versions(
-                update,
-                context
-            )
-
-        elif data == "admin_stats":
-
-            await admin_stats(
-                update,
-                context
-            )
-
-        elif data == "admin_settings":
-
-            await admin_settings(
-                update,
-                context
-            )
-
-        elif data == "admin_broadcast":
-
-            context.user_data["broadcast"] = True
-
-            await query.edit_message_text(
-                "📢 BROADCAST\n\n"
-                "Send the message you want to broadcast."
-            )
-
-        return
-
-
-# ============================================================
-# HTML ESCAPE
-# ============================================================
-
-def escape_html(text):
-
-    return (
-        text
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-# ============================================================
-# MY STATISTICS
-# ============================================================
-
-async def show_my_stats(update, context):
-
-    query = update.callback_query
-
-    user_id = query.from_user.id
-
-    projects = user_projects(user_id)
-
-    running = sum(
-        1 for p in projects
-        if p["status"] == "RUNNING"
-    )
-
-    connection = db()
-
-    deployments = connection.execute("""
-        SELECT COUNT(*)
-        FROM deployments
-        WHERE user_id = ?
-    """, (user_id,)).fetchone()[0]
-
-    connection.close()
-
-    await query.edit_message_text(
-        "📊 MY STATISTICS\n\n"
-        f"📦 Projects: {len(projects)}\n"
-        f"🟢 Running: {running}\n"
-        f"🔴 Stopped: {len(projects) - running}\n"
-        f"🚀 Deployments: {deployments}",
-        reply_markup=main_menu()
-    )
-
-
-# ============================================================
-# MY ACTIVITY
-# ============================================================
-
-async def show_my_activity(update, context):
-
-    query = update.callback_query
-
-    connection = db()
-
-    rows = connection.execute("""
-        SELECT *
-        FROM activity
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 15
-    """, (
-        query.from_user.id,
-    )).fetchall()
-
-    connection.close()
-
-    if not rows:
-
-        text = "📜 No activity."
-
-    else:
-
-        lines = []
-
-        for row in rows:
-
-            lines.append(
-                f"• {row['created_at']}\n"
-                f"  {row['action']} — {row['result']}"
-            )
-
-        text = "📜 MY ACTIVITY\n\n" + "\n\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        reply_markup=main_menu()
-    )
-
-
-# ============================================================
-# VERSIONS
-# ============================================================
-
-async def show_versions(update, context):
-
-    query = update.callback_query
-
-    project_id = query.data.split(":", 1)[1]
-
-    project = get_project(project_id)
-
-    if not project:
-
-        await query.edit_message_text(
-            "❌ Project not found."
-        )
-
-        return
-
-    rows = get_versions(project_id)
-
-    lines = [
-        f"🔄 VERSIONS — {project['name']}",
-        ""
-    ]
-
-    for row in rows:
-
-        icon = (
-            "🟢"
-            if row["status"] == "CURRENT"
-            else "⚪"
-        )
-
-        lines.append(
-            f"{icon} Version {row['version']} "
-            f"— {row['status']}"
-        )
-
-    await query.edit_message_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data=f"project:{project_id}"
-                )
-            ]
-        ])
-    )
-
-
-# ============================================================
-# ADMIN DASHBOARD
-# ============================================================
-
-async def admin_dashboard(update, context):
-
-    query = update.callback_query
-
-    connection = db()
-
-    users = connection.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
-
-    projects = connection.execute(
-        "SELECT COUNT(*) FROM projects"
-    ).fetchone()[0]
-
-    running = connection.execute("""
-        SELECT COUNT(*)
-        FROM projects
-        WHERE status = 'RUNNING'
-    """).fetchone()[0]
-
-    stopped = connection.execute("""
-        SELECT COUNT(*)
-        FROM projects
-        WHERE status = 'STOPPED'
-    """).fetchone()[0]
-
-    deployments = connection.execute(
-        "SELECT COUNT(*) FROM deployments"
-    ).fetchone()[0]
-
-    activities = connection.execute(
-        "SELECT COUNT(*) FROM activity"
-    ).fetchone()[0]
-
-    connection.close()
-
-    await query.edit_message_text(
-        "👑 ADMIN DASHBOARD\n\n"
-        f"👥 Users: {users}\n"
-        f"📦 Projects: {projects}\n"
-        f"🟢 Running: {running}\n"
-        f"🔴 Stopped: {stopped}\n"
-        f"🚀 Deployments: {deployments}\n"
-        f"📜 Activities: {activities}",
-        reply_markup=owner_menu()
-    )
-
-
-# ============================================================
-# ADMIN USERS
-# ============================================================
-
-async def admin_users(update, context):
-
-    query = update.callback_query
-
-    connection = db()
-
-    rows = connection.execute("""
-        SELECT *
-        FROM users
-        ORDER BY id DESC
-        LIMIT 30
-    """).fetchall()
-
-    connection.close()
-
-    if not rows:
-
-        text = "👥 No users."
-
-    else:
-
-        lines = [
-            "👥 USERS",
-            ""
-        ]
-
-        for row in rows:
-
-            status = (
-                "🚫 BLOCKED"
-                if row["blocked"]
-                else "🟢 ACTIVE"
-            )
-
-            lines.append(
-                f"{status}\n"
-                f"👤 {row['name']}\n"
-                f"🆔 {row['user_id']}\n"
-                f"🔗 @{row['username'] or '-'}\n"
-            )
-
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        reply_markup=owner_menu()
-    )
-
-
-# ============================================================
-# ADMIN PROJECTS
-# ============================================================
-
-async def admin_projects(update, context):
-
-    query = update.callback_query
-
-    connection = db()
-
-    rows = connection.execute("""
-        SELECT *
-        FROM projects
-        ORDER BY id DESC
-        LIMIT 30
-    """).fetchall()
-
-    connection.close()
-
-    if not rows:
-
-        text = "📦 No projects."
-
-    else:
-
-        lines = [
-            "📦 ALL PROJECTS",
-            ""
-        ]
-
-        for row in rows:
-
-            lines.append(
-                f"📦 {row['name']}\n"
-                f"🆔 {row['project_id']}\n"
-                f"👤 {row['user_id']}\n"
-                f"📌 {row['status']}\n"
-                f"🔄 V{row['current_version']}\n"
-            )
-
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        reply_markup=owner_menu()
-    )
-
-
-# ============================================================
-# ADMIN DEPLOYMENTS
-# ============================================================
-
-async def admin_deployments(update, context):
-
-    query = update.callback_query
-
-    connection = db()
-
-    rows = connection.execute("""
-        SELECT *
-        FROM deployments
-        ORDER BY id DESC
-        LIMIT 25
-    """).fetchall()
-
-    connection.close()
-
-    if not rows:
-
-        text = "🚀 No deployments."
-
-    else:
-
-        lines = [
-            "🚀 DEPLOYMENTS",
-            ""
-        ]
-
-        for row in rows:
-
-            lines.append(
-                f"📦 {row['project_id']}\n"
-                f"👤 {row['user_id']}\n"
-                f"🔢 Version: {row['version']}\n"
-                f"📌 {row['status']}\n"
-                f"🕐 {row['started_at']}\n"
-            )
-
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        reply_markup=owner_menu()
-    )
-
-
-# ============================================================
-# ADMIN LOGS
-# ============================================================
-
-async def admin_logs(update, context):
-
-    query = update.callback_query
-
-    connection = db()
-
-    rows = connection.execute("""
-        SELECT *
-        FROM activity
-        ORDER BY id DESC
-        LIMIT 30
-    """).fetchall()
-
-    connection.close()
-
-    if not rows:
-
-        text = "📜 No activity logs."
-
-    else:
-
-        lines = [
-            "📜 ADMIN ACTIVITY LOG",
-            ""
-        ]
-
-        for row in rows:
-
-            lines.append(
-                f"{row['created_at']}\n"
-                f"👤 {row['user_id']}\n"
-                f"⚙️ {row['action']}\n"
-                f"📌 {row['result']}\n"
-            )
-
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        reply_markup=owner_menu()
-    )
-
-
-# ============================================================
-# ADMIN VERSIONS
-# ============================================================
-
-async def admin_versions(update, context):
-
-    query = update.callback_query
-
-    connection = db()
-
-    rows = connection.execute("""
-        SELECT *
-        FROM versions
-        ORDER BY id DESC
-        LIMIT 30
-    """).fetchall()
-
-    connection.close()
-
-    if not rows:
-
-        text = "🔄 No versions."
-
-    else:
-
-        lines = [
-            "🔄 ALL VERSIONS",
-            ""
-        ]
-
-        for row in rows:
-
-            lines.append(
-                f"📦 {row['project_id']}\n"
-                f"🔢 V{row['version']}\n"
-                f"📌 {row['status']}\n"
-            )
-
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        reply_markup=owner_menu()
-    )
-
-
-# ============================================================
-# ADMIN STATS
-# ============================================================
-
-async def admin_stats(update, context):
-
-    query = update.callback_query
-
-    connection = db()
-
-    total_users = connection.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
-
-    blocked_users = connection.execute("""
-        SELECT COUNT(*)
-        FROM users
-        WHERE blocked = 1
-    """).fetchone()[0]
-
-    total_projects = connection.execute(
-        "SELECT COUNT(*) FROM projects"
-    ).fetchone()[0]
-
-    total_deployments = connection.execute(
-        "SELECT COUNT(*) FROM deployments"
-    ).fetchone()[0]
-
-    total_versions = connection.execute(
-        "SELECT COUNT(*) FROM versions"
-    ).fetchone()[0]
-
-    connection.close()
-
-    await query.edit_message_text(
-        "📈 GLOBAL STATISTICS\n\n"
-        f"👥 Users: {total_users}\n"
-        f"🚫 Blocked: {blocked_users}\n"
-        f"📦 Projects: {total_projects}\n"
-        f"🚀 Deployments: {total_deployments}\n"
-        f"🔄 Versions: {total_versions}",
-        reply_markup=owner_menu()
-    )
-
-
-# ============================================================
-# ADMIN SETTINGS
-# ============================================================
-
-async def admin_settings(update, context):
-
-    query = update.callback_query
-
-    await query.edit_message_text(
-        "⚙️ HOSTING SETTINGS\n\n"
-        f"♻️ Auto Restart: "
-        f"{'ON' if AUTO_RESTART else 'OFF'}\n\n"
-        f"📦 Max Upload: "
-        f"{MAX_UPLOAD_SIZE // (1024 * 1024)} MB\n\n"
-        f"🔄 Max Restart Attempts: "
-        f"{MAX_RESTART_ATTEMPTS}\n\n"
-        "These are currently configured in bot.py.",
-        reply_markup=owner_menu()
-    )
-
-
-# ============================================================
-# BROADCAST
-# ============================================================
-
-async def handle_broadcast(update, context):
-
-    if not is_owner(update.effective_user.id):
-
-        return
-
-    text = update.message.text
-
-    connection = db()
-
-    rows = connection.execute(
-        "SELECT user_id FROM users WHERE blocked = 0"
-    ).fetchall()
-
-    connection.close()
-
-    sent = 0
-    failed = 0
-
-    for row in rows:
-
-        try:
-
-            await update.get_bot().send_message(
-                chat_id=row["user_id"],
-                text=text
-            )
-
-            sent += 1
-
-            await asyncio.sleep(0.05)
-
-        except Exception:
-
-            failed += 1
-
-    context.user_data["broadcast"] = False
-
     await update.message.reply_text(
-        "📢 BROADCAST COMPLETED\n\n"
-        f"✅ Sent: {sent}\n"
-        f"❌ Failed: {failed}",
-        reply_markup=owner_menu()
+        f"🆔 Your Chat ID: `{u.id}`\n\n"
+        + ("✅ Access granted." if row and row["access"] else
+           "⏳ Access pending.\nOwner must approve your Chat ID before you can use hosting."),
+        parse_mode="Markdown",
+        reply_markup=main_menu() if row and row["access"] else None
     )
+    try:
+        uname = f"@{u.username}" if u.username else "Not set"
+        await context.bot.send_message(
+            OWNER_CHAT_ID,
+            "🆕 New User Started\n\n"
+            f"👤 Name: {u.full_name}\n"
+            f"🔹 Username: {uname}\n"
+            f"🆔 Chat ID: {u.id}\n"
+            f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    except Exception:
+        pass
 
+async def admin_cmd(update, context):
+    if not owner(update.effective_user.id):
+        return await deny(update, "Owner only.")
+    await update.message.reply_text("👑 Owner Control Panel", reply_markup=owner_menu())
 
-# ============================================================
-# TEXT HANDLER
-# ============================================================
+async def approve_cmd(update, context):
+    if not owner(update.effective_user.id):
+        return
+    if not context.args:
+        return await update.message.reply_text("Usage: /approve CHAT_ID")
+    uid = int(context.args[0])
+    con = db()
+    con.execute("UPDATE users SET access=1,blocked=0 WHERE user_id=?", (uid,))
+    con.commit(); con.close()
+    log_activity(OWNER_CHAT_ID, "approve_user", "OK", details=str(uid))
+    await update.message.reply_text(f"✅ Access granted: {uid}")
+    try:
+        await context.bot.send_message(uid, "✅ Owner granted you hosting access.\nSend /start to open panel.")
+    except Exception:
+        pass
+
+async def revoke_cmd(update, context):
+    if not owner(update.effective_user.id): return
+    if not context.args: return await update.message.reply_text("Usage: /revoke CHAT_ID")
+    uid = int(context.args[0])
+    con = db(); con.execute("UPDATE users SET access=0 WHERE user_id=?", (uid,)); con.commit(); con.close()
+    await update.message.reply_text(f"⛔ Access revoked: {uid}")
+
+async def block_cmd(update, context):
+    if not owner(update.effective_user.id): return
+    if not context.args: return await update.message.reply_text("Usage: /block CHAT_ID")
+    uid = int(context.args[0])
+    con = db(); con.execute("UPDATE users SET blocked=1 WHERE user_id=?", (uid,)); con.commit(); con.close()
+    await update.message.reply_text(f"🚫 Blocked: {uid}")
+
+async def unblock_cmd(update, context):
+    if not owner(update.effective_user.id): return
+    if not context.args: return await update.message.reply_text("Usage: /unblock CHAT_ID")
+    uid = int(context.args[0])
+    con = db(); con.execute("UPDATE users SET blocked=0 WHERE user_id=?", (uid,)); con.commit(); con.close()
+    await update.message.reply_text(f"✅ Unblocked: {uid}")
+
+async def maintenance_cmd(update, context):
+    if not owner(update.effective_user.id): return
+    if not context.args or context.args[0].lower() not in ("on","off"):
+        return await update.message.reply_text("Usage: /maintenance on|off")
+    val = context.args[0].lower() == "on"
+    set_setting("maintenance", int(val))
+    await update.message.reply_text("🛠 Maintenance " + ("ON" if val else "OFF"))
+
+async def status_cmd(update, context):
+    if not owner(update.effective_user.id): return
+    con = db()
+    users = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    access = con.execute("SELECT COUNT(*) c FROM users WHERE access=1 AND blocked=0").fetchone()["c"]
+    projects = con.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"]
+    running = con.execute("SELECT COUNT(*) c FROM projects WHERE status='running'").fetchone()["c"]
+    con.close()
+    await update.message.reply_text(
+        f"📊 Users: {users}\n✅ Allowed: {access}\n📦 Projects: {projects}\n🟢 Running: {running}"
+    )
 
 async def text_handler(update, context):
-
-    user = update.effective_user
-
-    register_user(user)
-
-    if is_blocked(user.id) and not is_owner(user.id):
-
+    # Conversation-lite project creation flow.
+    uid = update.effective_user.id
+    if not await ensure_user(update):
+        return
+    state = context.user_data.get("state")
+    if state == "new_project_name":
+        name = update.message.text.strip()
+        if not name:
+            return await update.message.reply_text("Invalid name.")
+        con = db()
+        count = con.execute("SELECT COUNT(*) c FROM projects WHERE user_id=?", (uid,)).fetchone()["c"]
+        con.close()
+        if count >= int(setting("max_projects_per_user", "10")) and not owner(uid):
+            return await update.message.reply_text("Project limit reached.")
+        slug = unique_slug(name)
+        p = PROJECTS_DIR / slug
+        p.mkdir(parents=True, exist_ok=True)
+        now = int(time.time())
+        con = db()
+        cur = con.execute(
+            "INSERT INTO projects(user_id,name,slug,path,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (uid, name, slug, str(p), now, now)
+        )
+        pid = cur.lastrowid
+        con.commit(); con.close()
+        context.user_data["state"] = None
+        log_activity(uid, "create_project", "OK", pid, name)
         await update.message.reply_text(
-            "🚫 You are blocked."
+            f"✅ Project created.\n📦 {name}\n🆔 Project ID: {pid}\n\n"
+            "Now upload a .zip or .py file.",
+            reply_markup=project_buttons(pid, owner(uid))
         )
+        return
+    await update.message.reply_text("Use the buttons below.", reply_markup=main_menu())
 
+async def document_handler(update, context):
+    if not await ensure_user(update):
+        return
+    doc = update.message.document
+    if not doc:
+        return
+    uid = update.effective_user.id
+    pid = context.user_data.get("upload_pid")
+    if not pid:
+        return await update.message.reply_text("Open a project first, then choose Upload.")
+    con = db()
+    project = con.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    con.close()
+    if not project or (project["user_id"] != uid and not owner(uid)):
+        return await update.message.reply_text("Project access denied.")
+    filename = Path(doc.file_name or "upload.bin").name
+    if not filename.lower().endswith((".zip", ".py")):
+        return await update.message.reply_text("Only .zip and .py are supported.")
+    await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+    tgfile = await doc.get_file()
+    temp = Path(tempfile.mkdtemp(dir=TEMP_DIR))
+    raw = temp / filename
+    await tgfile.download_to_drive(str(raw))
+    staging = Path(tempfile.mkdtemp(dir=TEMP_DIR))
+    try:
+        if filename.lower().endswith(".zip"):
+            with zipfile.ZipFile(raw) as z:
+                for info in z.infolist():
+                    member = Path(info.filename)
+                    if member.is_absolute() or ".." in member.parts:
+                        raise ValueError("Unsafe ZIP path detected.")
+                z.extractall(staging)
+            children = list(staging.iterdir())
+            if len(children) == 1 and children[0].is_dir():
+                real_staging = children[0]
+            else:
+                real_staging = staging
+        else:
+            shutil.copy2(raw, staging / filename)
+            real_staging = staging
+
+        # deploy_path moves staging, so do not delete it afterward.
+        ok, msg = deploy_path(pid, real_staging)
+        if ok:
+            await update.message.reply_text("🚀 Deployment successful!\n\n" + msg,
+                                            reply_markup=project_buttons(pid, owner(uid)))
+        else:
+            await update.message.reply_text("❌ Deployment failed.\n\n" + msg)
+    except Exception as e:
+        await update.message.reply_text("❌ Upload/deployment error:\n" + str(e))
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+        # If deploy_path failed, staging may still exist.
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+def project_buttons(pid, is_owner=False):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Start", callback_data=f"pstart:{pid}"),
+         InlineKeyboardButton("🔴 Stop", callback_data=f"pstop:{pid}")],
+        [InlineKeyboardButton("🔄 Restart", callback_data=f"prestart:{pid}"),
+         InlineKeyboardButton("📜 Logs", callback_data=f"plogs:{pid}")],
+        [InlineKeyboardButton("📁 Files", callback_data=f"files:{pid}"),
+         InlineKeyboardButton("🕘 Versions", callback_data=f"versions:{pid}")],
+        [InlineKeyboardButton("📤 Upload", callback_data=f"upload:{pid}"),
+         InlineKeyboardButton("🗑 Delete", callback_data=f"pdelete:{pid}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="aprojects" if is_owner else "projects")]
+    ])
+
+async def show_projects(q, uid, admin=False):
+    con = db()
+    if admin:
+        rows = con.execute("SELECT * FROM projects ORDER BY id DESC LIMIT 50").fetchall()
+    else:
+        rows = con.execute("SELECT * FROM projects WHERE user_id=? ORDER BY id DESC", (uid,)).fetchall()
+    con.close()
+    if not rows:
+        return await q.edit_message_text("📦 No projects.", reply_markup=owner_menu() if admin else main_menu())
+    buttons = []
+    for r in rows:
+        buttons.append([InlineKeyboardButton(
+            f"{'🟢' if r['status']=='running' else '🔴'} {r['name']} | #{r['id']}",
+            callback_data=f"showp:{r['id']}"
+        )])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="adashboard" if admin else "home")])
+    await q.edit_message_text("📦 Projects", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    upsert_user(q.from_user)
+    data = q.data
+
+    if data == "home":
+        if await ensure_user(update): await q.edit_message_text("Main Panel", reply_markup=main_menu())
+        return
+    if data == "projects":
+        if await ensure_user(update): await show_projects(q, uid, False)
+        return
+    if data == "newproject":
+        if await ensure_user(update):
+            context.user_data["state"] = "new_project_name"
+            await q.edit_message_text("✍️ Send the new project name:")
+        return
+    if data == "mystats":
+        if not await ensure_user(update): return
+        con = db()
+        n = con.execute("SELECT COUNT(*) c FROM projects WHERE user_id=?", (uid,)).fetchone()["c"]
+        d = con.execute("SELECT COUNT(*) c FROM deployments WHERE user_id=?", (uid,)).fetchone()["c"]
+        con.close()
+        await q.edit_message_text(f"📊 Your Stats\n\nProjects: {n}\nDeployments: {d}",
+                                  reply_markup=main_menu())
+        return
+    if data == "help":
+        await q.edit_message_text(
+            "⚡ Ultimate Hosting\n\n"
+            "1. Create project\n2. Upload ZIP/PY\n3. Requirements install\n"
+            "4. Syntax check\n5. Deploy\n6. Start/Stop/Restart\n"
+            "7. Logs\n8. Versions/Rollback\n\n"
+            "Owner must approve your Chat ID first.",
+            reply_markup=main_menu())
         return
 
-    if (
-        is_owner(user.id)
-        and context.user_data.get("broadcast")
-    ):
-
-        await handle_broadcast(
-            update,
-            context
-        )
-
+    if not owner(uid) and not await ensure_user(update):
         return
 
-    await update.message.reply_text(
-        "⚡ Use the buttons below.",
-        reply_markup=(
-            owner_menu()
-            if is_owner(user.id)
-            else main_menu()
-        )
-    )
+    if data == "adashboard":
+        if not owner(uid): return
+        con = db()
+        users = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        projects = con.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"]
+        running = con.execute("SELECT COUNT(*) c FROM projects WHERE status='running'").fetchone()["c"]
+        failed = con.execute("SELECT COUNT(*) c FROM projects WHERE status='failed'").fetchone()["c"]
+        deps = con.execute("SELECT COUNT(*) c FROM deployments").fetchone()["c"]
+        con.close()
+        await q.edit_message_text(
+            f"👑 Dashboard\n\n👥 Users: {users}\n📦 Projects: {projects}\n"
+            f"🟢 Running: {running}\n❌ Failed: {failed}\n🚀 Deployments: {deps}",
+            reply_markup=owner_menu())
+        return
+    if data == "ausers":
+        if not owner(uid): return
+        con = db()
+        rows = con.execute("SELECT * FROM users ORDER BY last_active DESC LIMIT 40").fetchall()
+        con.close()
+        buttons = [[InlineKeyboardButton(
+            f"{'🚫' if r['blocked'] else ('✅' if r['access'] else '⏳')} {r['name'][:22]} | {r['user_id']}",
+            callback_data=f"user:{r['user_id']}"
+        )] for r in rows]
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="adashboard")])
+        await q.edit_message_text("👥 Users", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    if data.startswith("user:"):
+        if not owner(uid): return
+        x = int(data.split(":")[1])
+        con = db()
+        u = con.execute("SELECT * FROM users WHERE user_id=?", (x,)).fetchone()
+        pc = con.execute("SELECT COUNT(*) c FROM projects WHERE user_id=?", (x,)).fetchone()["c"]
+        dc = con.execute("SELECT COUNT(*) c FROM deployments WHERE user_id=?", (x,)).fetchone()["c"]
+        con.close()
+        if not u: return await q.edit_message_text("User not found.", reply_markup=owner_menu())
+        await q.edit_message_text(
+            f"👤 {u['name']}\n🔹 @{u['username']}\n🆔 {u['user_id']}\n"
+            f"🔐 Access: {'YES' if u['access'] else 'NO'}\n🚫 Blocked: {'YES' if u['blocked'] else 'NO'}\n"
+            f"📦 Projects: {pc}\n🚀 Deployments: {dc}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Approve", callback_data=f"uapprove:{x}"),
+                 InlineKeyboardButton("⛔ Revoke", callback_data=f"urevoke:{x}")],
+                [InlineKeyboardButton("🚫 Block", callback_data=f"ublock:{x}"),
+                 InlineKeyboardButton("🔓 Unblock", callback_data=f"uunblock:{x}")],
+                [InlineKeyboardButton("📦 Projects", callback_data=f"uproj:{x}")],
+                [InlineKeyboardButton("🔙 Users", callback_data="ausers")]
+            ]))
+        return
+    if data.startswith(("uapprove:", "urevoke:", "ublock:", "uunblock:")):
+        if not owner(uid): return
+        action, raw = data.split(":")
+        x = int(raw)
+        field = {"uapprove":"access=1,blocked=0","urevoke":"access=0","ublock":"blocked=1","uunblock":"blocked=0"}[action]
+        con = db(); con.execute(f"UPDATE users SET {field} WHERE user_id=?", (x,)); con.commit(); con.close()
+        await q.answer("Updated.", show_alert=True)
+        return
+    if data.startswith("uproj:"):
+        if not owner(uid): return
+        x = int(data.split(":")[1])
+        await show_projects(q, x, False)
+        return
+    if data == "aprojects":
+        if not owner(uid): return
+        await show_projects(q, uid, True)
+        return
+    if data.startswith("showp:"):
+        pid = int(data.split(":")[1])
+        con = db(); p = con.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone(); con.close()
+        if not p: return await q.edit_message_text("Project not found.", reply_markup=owner_menu() if owner(uid) else main_menu())
+        if p["user_id"] != uid and not owner(uid):
+            return await q.answer("Access denied.", show_alert=True)
+        await q.edit_message_text(
+            f"📦 {p['name']}\n🆔 {p['id']}\n👤 Owner: {p['user_id']}\n"
+            f"📌 Status: {p['status']}\n🐍 Startup: {p['startup_file']}\n"
+            f"♻️ Auto Restart: {'ON' if p['auto_restart'] else 'OFF'}\n"
+            f"🔢 Version: {p['current_version']}",
+            reply_markup=project_buttons(pid, owner(uid)))
+        return
 
+    if data.startswith("pstart:"):
+        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone(); con.close()
+        if not p or (p["user_id"]!=uid and not owner(uid)): return
+        ok,msg=start_project_sync(pid); await q.edit_message_text(("🟢 " if ok else "❌ ")+msg, reply_markup=project_buttons(pid,owner(uid))); return
+    if data.startswith("pstop:"):
+        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone(); con.close()
+        if not p or (p["user_id"]!=uid and not owner(uid)): return
+        ok,msg=stop_project_sync(pid); await q.edit_message_text(("🔴 " if ok else "❌ ")+msg, reply_markup=project_buttons(pid,owner(uid))); return
+    if data.startswith("prestart:"):
+        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone(); con.close()
+        if not p or (p["user_id"]!=uid and not owner(uid)): return
+        stop_project_sync(pid); ok,msg=start_project_sync(pid); await q.edit_message_text(("🔄 " if ok else "❌ ")+msg, reply_markup=project_buttons(pid,owner(uid))); return
+    if data.startswith("plogs:"):
+        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone(); con.close()
+        if not p or (p["user_id"]!=uid and not owner(uid)): return
+        lp=project_log_path(pid)
+        txt=lp.read_text(encoding="utf-8",errors="replace")[-3500:] if lp.exists() else "No logs."
+        await q.edit_message_text("📜 Logs\n\n"+txt, reply_markup=project_buttons(pid,owner(uid))); return
+    if data.startswith("upload:"):
+        pid=int(data.split(":")[1]); context.user_data["upload_pid"]=pid
+        await q.edit_message_text("📤 Send a .zip or .py document now.", reply_markup=project_buttons(pid,owner(uid))); return
+    if data.startswith("files:"):
+        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone(); con.close()
+        if not p or (p["user_id"]!=uid and not owner(uid)): return
+        root=project_dir(p)
+        items=[]
+        for x in sorted(root.rglob("*")):
+            if ".versions" in x.parts: continue
+            rel=x.relative_to(root)
+            if len(rel.parts)<=3:
+                items.append(("📁 " if x.is_dir() else "📄 ")+str(rel))
+        txt="\n".join(items[:80]) or "Empty."
+        await q.edit_message_text("📁 Files\n\n"+txt, reply_markup=project_buttons(pid,owner(uid))); return
+    if data.startswith("versions:"):
+        pid=int(data.split(":")[1]); con=db(); rows=con.execute("SELECT * FROM versions WHERE project_id=? ORDER BY version_no DESC LIMIT 30",(pid,)).fetchall(); con.close()
+        buttons=[[InlineKeyboardButton(f"v{r['version_no']} — rollback",callback_data=f"rollback:{pid}:{r['version_no']}")] for r in rows]
+        buttons.append([InlineKeyboardButton("🔙 Back",callback_data=f"showp:{pid}")])
+        await q.edit_message_text("🕘 Versions",reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("rollback:"):
+        _,raw,rv=data.split(":"); pid=int(raw); ver=int(rv)
+        con=db(); p=con.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone(); v=con.execute("SELECT * FROM versions WHERE project_id=? AND version_no=?",(pid,ver)).fetchone(); con.close()
+        if not p or not v or (p["user_id"]!=uid and not owner(uid)): return
+        stop_project_sync(pid)
+        src=Path(v["path"]); dest=project_dir(p)
+        if not src.exists(): return await q.edit_message_text("Version files missing.",reply_markup=project_buttons(pid,owner(uid)))
+        keep=tempfile.mkdtemp(dir=PROJECTS_DIR)
+        try:
+            # Preserve .versions, replace project content.
+            versions = dest / ".versions"
+            if versions.exists(): shutil.copytree(versions, Path(keep)/".versions")
+            for child in dest.iterdir(): shutil.rmtree(child,ignore_errors=True) if child.is_dir() else child.unlink(missing_ok=True)
+            for child in src.iterdir():
+                if child.name == ".versions": continue
+                shutil.copytree(child,dest/child.name) if child.is_dir() else shutil.copy2(child,dest/child.name)
+            if (Path(keep)/".versions").exists():
+                shutil.copytree(Path(keep)/".versions", dest/".versions", dirs_exist_ok=True)
+            startup=startup_candidates(dest)
+            con=db(); con.execute("UPDATE projects SET startup_file=?,status='stopped',updated_at=? WHERE id=?",(startup,int(time.time()),pid)); con.commit(); con.close()
+            await q.edit_message_text(f"🔙 Rolled back to v{ver}.",reply_markup=project_buttons(pid,owner(uid)))
+        finally: shutil.rmtree(keep,ignore_errors=True)
+        return
+    if data.startswith("pdelete:"):
+        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone(); con.close()
+        if not p or (p["user_id"]!=uid and not owner(uid)): return
+        await q.edit_message_text("⚠️ Confirm project deletion?",
+                                  reply_markup=InlineKeyboardMarkup([
+                                      [InlineKeyboardButton("❌ YES DELETE",callback_data=f"confirmdelete:{pid}")],
+                                      [InlineKeyboardButton("Cancel",callback_data=f"showp:{pid}")]
+                                  ])); return
+    if data.startswith("confirmdelete:"):
+        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone(); con.close()
+        if not p or (p["user_id"]!=uid and not owner(uid)): return
+        stop_project_sync(pid)
+        shutil.rmtree(project_dir(p),ignore_errors=True); project_log_path(pid).unlink(missing_ok=True)
+        con=db(); con.execute("DELETE FROM projects WHERE id=?",(pid,)); con.commit(); con.close()
+        await q.edit_message_text("🗑 Project deleted.",reply_markup=owner_menu() if owner(uid) else main_menu()); return
 
-# ============================================================
-# ERROR HANDLER
-# ============================================================
+    if data == "adeployments":
+        if not owner(uid): return
+        con=db(); rows=con.execute("SELECT * FROM deployments ORDER BY id DESC LIMIT 30").fetchall(); con.close()
+        txt="\n".join(f"#{r['id']} P{r['project_id']} v{r['version_no']} {r['status']}" for r in rows) or "No deployments."
+        await q.edit_message_text("🚀 Deployments\n\n"+txt,reply_markup=owner_menu()); return
+    if data == "aactivity":
+        if not owner(uid): return
+        con=db(); rows=con.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 40").fetchall(); con.close()
+        txt="\n".join(f"{r['created_at']} | U{r['user_id']} | P{r['project_id']} | {r['action']} | {r['result']}" for r in rows) or "No activity."
+        await q.edit_message_text("📜 Activity\n\n"+txt[-3800:],reply_markup=owner_menu()); return
+    if data == "asettings":
+        if not owner(uid): return
+        await q.edit_message_text(
+            f"⚙️ Settings\n\nMax projects/user: {setting('max_projects_per_user')}\n"
+            f"Log retention: {setting('log_retention')}\nMaintenance: {setting('maintenance')}",
+            reply_markup=owner_menu()); return
+    if data == "amaint":
+        if not owner(uid): return
+        await q.edit_message_text(
+            f"🛠 Maintenance: {'ON' if maintenance_on() else 'OFF'}\nUse /maintenance on or /maintenance off",
+            reply_markup=owner_menu()); return
+    if data == "abroadcast":
+        if not owner(uid): return
+        context.user_data["state"]="broadcast"
+        await q.edit_message_text("📢 Send the broadcast text:")
+        return
 
-async def error_handler(update, context):
+async def broadcast_text(update, context):
+    if not owner(update.effective_user.id): return
+    if context.user_data.get("state") != "broadcast": return
+    text=update.message.text
+    con=db(); rows=con.execute("SELECT user_id FROM users WHERE blocked=0 AND access=1").fetchall(); con.close()
+    sent=0
+    for r in rows:
+        try:
+            await context.bot.send_message(r["user_id"], "📢 Owner Broadcast\n\n"+text)
+            sent+=1
+        except Exception:
+            pass
+    context.user_data["state"]=None
+    await update.message.reply_text(f"✅ Broadcast sent to {sent} users.",reply_markup=owner_menu())
 
-    print(
-        "ERROR:",
-        context.error
-    )
+# -------------------- RENDER WEB SERVICE --------------------
 
+@app_web.route("/")
+def home():
+    return "⚡ KRUTIK CYBER EXPERT — ULTIMATE BOT HOSTING"
 
-# ============================================================
-# MAIN
-# ============================================================
+@app_web.route("/health")
+def health():
+    return "OK"
+
+def run_web():
+    port=int(os.environ.get("PORT","10000"))
+    app_web.run(host="0.0.0.0",port=port,debug=False,use_reloader=False)
 
 def main():
+    init_db()
+    Thread(target=run_web, daemon=True).start()
+    Thread(target=monitor_processes, daemon=True).start()
 
-    global CURRENT_APPLICATION
+    application=Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start",start_cmd))
+    application.add_handler(CommandHandler("admin",admin_cmd))
+    application.add_handler(CommandHandler("approve",approve_cmd))
+    application.add_handler(CommandHandler("revoke",revoke_cmd))
+    application.add_handler(CommandHandler("block",block_cmd))
+    application.add_handler(CommandHandler("unblock",unblock_cmd))
+    application.add_handler(CommandHandler("maintenance",maintenance_cmd))
+    application.add_handler(CommandHandler("status",status_cmd))
+    application.add_handler(CallbackQueryHandler(callback))
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_text, block=False))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    if (
-        not BOT_TOKEN
-        or BOT_TOKEN == "YAHAN_APNA_BOT_TOKEN_DALO"
-    ):
+    print("⚡ KRUTIK CYBER EXPERT — ULTIMATE BOT HOSTING")
+    print("Render Web Service bridge started.")
+    print("Telegram polling started.")
+    application.run_polling(drop_pending_updates=True)
 
-        print(
-            "\n❌ BOT_TOKEN set karo bot.py mein.\n"
-        )
-
-        return
-
-    print("=" * 60)
-
-    print(
-        "⚡ KRUTIK CYBER EXPERT — "
-        "ULTIMATE BOT HOSTING"
-    )
-
-    print("=" * 60)
-
-    print(
-        f"Database: {DB_PATH}"
-    )
-
-    print(
-        f"Projects: {PROJECTS_DIR}"
-    )
-
-    print(
-        f"Owner: {OWNER_CHAT_ID}"
-    )
-
-    print("=" * 60)
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    CURRENT_APPLICATION = application
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            callbacks
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            handle_document
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_handler
-        )
-    )
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    print(
-        "🚀 Hosting bot started."
-    )
-
-    application.run_polling(
-        drop_pending_updates=True
-    )
-
-
-if __name__ == "__main__":
-
+if __name__=="__main__":
     main()
