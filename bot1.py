@@ -27,8 +27,14 @@ from telegram.ext import (
 # Render Web Service + Telegram polling
 # ============================================================
 
-BOT_TOKEN = "YAHAN_APNA_BOT_TOKEN_DALO"
-OWNER_CHAT_ID = 7272787842
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+# Telegram numeric Chat ID (Render Environment Variable se liya jayega)
+OWNER_CHAT_ID_RAW = os.getenv("OWNER_CHAT_ID", "").strip()
+try:
+    OWNER_CHAT_ID = int(OWNER_CHAT_ID_RAW) if OWNER_CHAT_ID_RAW else 0
+except ValueError:
+    OWNER_CHAT_ID = 0
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "hosting.db"
