@@ -27,14 +27,8 @@ from telegram.ext import (
 # Render Web Service + Telegram polling
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-# Telegram numeric Chat ID (Render Environment Variable se liya jayega)
-OWNER_CHAT_ID_RAW = os.getenv("OWNER_CHAT_ID", "").strip()
-try:
-    OWNER_CHAT_ID = int(OWNER_CHAT_ID_RAW) if OWNER_CHAT_ID_RAW else 0
-except ValueError:
-    OWNER_CHAT_ID = 0
+BOT_TOKEN = "YAHAN_APNA_BOT_TOKEN_DALO"
+OWNER_CHAT_ID = 7272787842
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "hosting.db"
@@ -503,8 +497,13 @@ async def ensure_user(update):
     return True
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user(update.effective_user)
     u = update.effective_user
+    # /start always returns to the main panel and clears pending input state.
+    context.user_data.pop("state", None)
+    context.user_data.pop("upload_pid", None)
+    # Notify owner only when this Telegram user is first seen.
+    is_new_user = get_user(u.id) is None
+    upsert_user(u)
     row = get_user(u.id)
     if owner(u.id):
         await update.message.reply_text(
@@ -526,18 +525,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=main_menu() if row and row["access"] else None
     )
-    try:
-        uname = f"@{u.username}" if u.username else "Not set"
-        await context.bot.send_message(
-            OWNER_CHAT_ID,
-            "🆕 New User Started\n\n"
-            f"👤 Name: {u.full_name}\n"
-            f"🔹 Username: {uname}\n"
-            f"🆔 Chat ID: {u.id}\n"
-            f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-    except Exception:
-        pass
+    if is_new_user:
+        try:
+            uname = f"@{u.username}" if u.username else "Not set"
+            await context.bot.send_message(
+                OWNER_CHAT_ID,
+                "🆕 New User Started\n\n"
+                f"👤 Name: {u.full_name}\n"
+                f"🔹 Username: {uname}\n"
+                f"🆔 Chat ID: {u.id}\n"
+                f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        except Exception:
+            pass
 
 async def admin_cmd(update, context):
     if not owner(update.effective_user.id):
@@ -602,39 +602,81 @@ async def status_cmd(update, context):
     )
 
 async def text_handler(update, context):
-    # Conversation-lite project creation flow.
     uid = update.effective_user.id
     if not await ensure_user(update):
         return
+
     state = context.user_data.get("state")
+
     if state == "new_project_name":
-        name = update.message.text.strip()
+        name = (update.message.text or "").strip()
         if not name:
-            return await update.message.reply_text("Invalid name.")
+            await update.message.reply_text("❌ Invalid project name. Please try again.")
+            return
+        if len(name) > 80:
+            await update.message.reply_text("❌ Project name must be 80 characters or less.")
+            return
+
         con = db()
-        count = con.execute("SELECT COUNT(*) c FROM projects WHERE user_id=?", (uid,)).fetchone()["c"]
+        count = con.execute(
+            "SELECT COUNT(*) c FROM projects WHERE user_id=?", (uid,)
+        ).fetchone()["c"]
         con.close()
         if count >= int(setting("max_projects_per_user", "10")) and not owner(uid):
-            return await update.message.reply_text("Project limit reached.")
-        slug = unique_slug(name)
-        p = PROJECTS_DIR / slug
-        p.mkdir(parents=True, exist_ok=True)
-        now = int(time.time())
-        con = db()
-        cur = con.execute(
-            "INSERT INTO projects(user_id,name,slug,path,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (uid, name, slug, str(p), now, now)
-        )
-        pid = cur.lastrowid
-        con.commit(); con.close()
-        context.user_data["state"] = None
+            context.user_data.pop("state", None)
+            await update.message.reply_text("❌ Project limit reached.", reply_markup=main_menu())
+            return
+
+        try:
+            slug = unique_slug(name)
+            p = PROJECTS_DIR / slug
+            p.mkdir(parents=True, exist_ok=False)
+            now = int(time.time())
+            con = db()
+            cur = con.execute(
+                "INSERT INTO projects(user_id,name,slug,path,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (uid, name, slug, str(p), now, now)
+            )
+            pid = cur.lastrowid
+            con.commit()
+            con.close()
+        except Exception as e:
+            context.user_data.pop("state", None)
+            await update.message.reply_text(
+                "❌ Project creation failed.\n\n" + str(e),
+                reply_markup=main_menu()
+            )
+            return
+
+        context.user_data.pop("state", None)
+        context.user_data["upload_pid"] = pid
         log_activity(uid, "create_project", "OK", pid, name)
         await update.message.reply_text(
-            f"✅ Project created.\n📦 {name}\n🆔 Project ID: {pid}\n\n"
-            "Now upload a .zip or .py file.",
+            f"✅ Project created successfully!\n\n"
+            f"📦 Name: {name}\n"
+            f"🆔 Project ID: {pid}\n\n"
+            "📤 Now press Upload and send your `.zip` or `.py` file.",
+            parse_mode="Markdown",
             reply_markup=project_buttons(pid, owner(uid))
         )
         return
+
+    if state == "broadcast" and owner(uid):
+        text = (update.message.text or "").strip()
+        con = db()
+        rows = con.execute("SELECT user_id FROM users WHERE blocked=0 AND access=1").fetchall()
+        con.close()
+        sent = 0
+        for r in rows:
+            try:
+                await context.bot.send_message(r["user_id"], "📢 Owner Broadcast\n\n" + text)
+                sent += 1
+            except Exception:
+                pass
+        context.user_data.pop("state", None)
+        await update.message.reply_text(f"✅ Broadcast sent to {sent} users.", reply_markup=owner_menu())
+        return
+
     await update.message.reply_text("Use the buttons below.", reply_markup=main_menu())
 
 async def document_handler(update, context):
@@ -739,8 +781,15 @@ async def callback(update, context):
         return
     if data == "newproject":
         if await ensure_user(update):
+            context.user_data.pop("upload_pid", None)
             context.user_data["state"] = "new_project_name"
-            await q.edit_message_text("✍️ Send the new project name:")
+            await q.edit_message_text(
+                "✍️ Send the new project name:\n\nExample: `MyTestBot`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data="home")]
+                ])
+            )
         return
     if data == "mystats":
         if not await ensure_user(update): return
@@ -947,21 +996,6 @@ async def callback(update, context):
         await q.edit_message_text("📢 Send the broadcast text:")
         return
 
-async def broadcast_text(update, context):
-    if not owner(update.effective_user.id): return
-    if context.user_data.get("state") != "broadcast": return
-    text=update.message.text
-    con=db(); rows=con.execute("SELECT user_id FROM users WHERE blocked=0 AND access=1").fetchall(); con.close()
-    sent=0
-    for r in rows:
-        try:
-            await context.bot.send_message(r["user_id"], "📢 Owner Broadcast\n\n"+text)
-            sent+=1
-        except Exception:
-            pass
-    context.user_data["state"]=None
-    await update.message.reply_text(f"✅ Broadcast sent to {sent} users.",reply_markup=owner_menu())
-
 # -------------------- RENDER WEB SERVICE --------------------
 
 @app_web.route("/")
@@ -992,7 +1026,6 @@ def main():
     application.add_handler(CommandHandler("status",status_cmd))
     application.add_handler(CallbackQueryHandler(callback))
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_text, block=False))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     print("⚡ KRUTIK CYBER EXPERT — ULTIMATE BOT HOSTING")
