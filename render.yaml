@@ -1,9 +1,15 @@
 services:
-  - type: web
-    name: krutik-ticket-support-bot
+  - type: web service
+    name: code-save-and-share
     runtime: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot1.py
-    autoDeploy: true
-    
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+
+      - key: STORAGE_CHANNEL_ID
+        sync: false
+
+      - key: MAX_FILE_SIZE_MB
+        value: "50"
