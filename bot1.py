@@ -50,9 +50,18 @@ def upsert(u):
 def blocked(uid):
     c=conn(); r=c.execute("SELECT blocked FROM users WHERE user_id=?",(uid,)).fetchone(); c.close()
     return bool(r and r["blocked"])
-def admin(uid):
-    if uid==OWNER_CHAT_ID:return True
-    c=conn(); r=c.execute("SELECT 1 FROM admins WHERE user_id=?",(uid,)).fetchone(); c.close(); return bool(r)
+def is_admin(uid):
+    if uid == OWNER_CHAT_ID:
+        return True
+
+    c = conn()
+    r = c.execute(
+        "SELECT 1 FROM admins WHERE user_id=?",
+        (uid,)
+    ).fetchone()
+    c.close()
+
+    return bool(r)
 def activity(uid,a,d=""):
     c=conn(); c.execute("INSERT INTO activity_logs(actor_id,action,details,created_at) VALUES(?,?,?,?)",(uid,a,d,now())); c.commit(); c.close()
 def setting(k,d="0"):
