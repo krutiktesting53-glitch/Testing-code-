@@ -192,7 +192,8 @@ async def adm_cb(update,ctx):
 
 async def req_cb(update,ctx):
     q=update.callback_query; await q.answer()
-    if not admin(q.from_user.id):return
+    if not admin(q.from_user.id, context):
+    return
     _,action,rid=q.data.split(":"); rid=int(rid); c=conn(); r=c.execute("SELECT * FROM requests WHERE id=?",(rid,)).fetchone()
     if not r:return await q.edit_message_text("Request not found.")
     if action=="view":
