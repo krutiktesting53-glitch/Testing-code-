@@ -1,5 +1,5 @@
 services:
-  - type: Web service
+  - type: web
     name: code-save-and-share
     runtime: python
     buildCommand: pip install -r requirements.txt
