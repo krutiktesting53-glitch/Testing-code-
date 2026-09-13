@@ -1,289 +1,1309 @@
-import os, sqlite3, logging, asyncio
-from datetime import datetime
-from threading import Thread
-from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+import os
+import sqlite3
+import secrets
+import logging
+from datetime import datetime, timezone
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+STORAGE_CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
 
-# Telegram numeric Chat ID (Render Environment Variable se liya jayega)
-OWNER_CHAT_ID_RAW = os.getenv("OWNER_CHAT_ID", "").strip()
-try:
-    OWNER_CHAT_ID = int(OWNER_CHAT_ID_RAW) if OWNER_CHAT_ID_RAW else 0
-except ValueError:
-    OWNER_CHAT_ID = 0
-DB_PATH = os.path.join(os.getcwd(), "support.db")
-PORT = int(os.environ.get("PORT", 10000))
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-log = logging.getLogger("KRUTIK_SUPPORT")
+# Owner Telegram username / branding
+OWNER_USERNAME = "@Cyber_expert_KRUTIK"
 
-web = Flask(__name__)
-@web.get("/")
-def home(): return "⚡ KRUTIK CYBER EXPERT — TICKET SUPPORT BOT"
-@web.get("/health")
-def health(): return "OK"
-def run_web(): web.run(host="0.0.0.0", port=PORT)
+DB_PATH = "code_share.db"
 
-def conn():
-    c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row; return c
-def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def db():
+    return sqlite3.connect(DB_PATH)
+
 
 def init_db():
-    c=conn()
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,name TEXT,username TEXT,joined_at TEXT,last_active TEXT,blocked INTEGER DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,service TEXT,details TEXT,status TEXT DEFAULT 'pending',reason TEXT,created_at TEXT,updated_at TEXT);
-    CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,category TEXT,priority TEXT DEFAULT 'normal',subject TEXT,status TEXT DEFAULT 'open',assigned_admin INTEGER,created_at TEXT,updated_at TEXT);
-    CREATE TABLE IF NOT EXISTS ticket_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER,sender_id INTEGER,sender_type TEXT,message_type TEXT,text TEXT,telegram_message_id INTEGER,created_at TEXT);
-    CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY,role TEXT,added_at TEXT);
-    CREATE TABLE IF NOT EXISTS activity_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id INTEGER,action TEXT,details TEXT,created_at TEXT);
-    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
-    """); c.commit(); c.close()
+    con = db()
+    cur = con.cursor()
 
-def upsert(u):
-    c=conn(); old=c.execute("SELECT user_id FROM users WHERE user_id=?",(u.id,)).fetchone()
-    if old: c.execute("UPDATE users SET name=?,username=?,last_active=? WHERE user_id=?",(u.full_name,u.username,now(),u.id))
-    else: c.execute("INSERT INTO users VALUES(?,?,?,?,?,0)",(u.id,u.full_name,u.username,now(),now()))
-    c.commit(); c.close()
-def blocked(uid):
-    c=conn(); r=c.execute("SELECT blocked FROM users WHERE user_id=?",(uid,)).fetchone(); c.close()
-    return bool(r and r["blocked"])
-def is_admin(uid):
-    if uid == OWNER_CHAT_ID:
-        return True
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            is_blocked INTEGER DEFAULT 0,
+            joined_at TEXT,
+            last_active TEXT
+        )
+    """)
 
-    c = conn()
-    r = c.execute(
-        "SELECT 1 FROM admins WHERE user_id=?",
-        (uid,)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_id TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            language TEXT DEFAULT '',
+            file_name TEXT NOT NULL,
+            file_size INTEGER DEFAULT 0,
+            storage_chat_id TEXT NOT NULL,
+            storage_message_id INTEGER NOT NULL,
+            created_at TEXT,
+            updated_at TEXT,
+            is_deleted INTEGER DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS share_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_id TEXT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at TEXT,
+            expires_at TEXT,
+            max_uses INTEGER DEFAULT 0,
+            used_count INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS retrievals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_id TEXT NOT NULL,
+            share_token TEXT,
+            user_id INTEGER NOT NULL,
+            retrieved_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT,
+            code_id TEXT,
+            details TEXT,
+            created_at TEXT
+        )
+    """)
+
+    con.commit()
+    con.close()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def user_blocked(user_id):
+    con = db()
+    row = con.execute(
+        "SELECT is_blocked FROM users WHERE user_id=?",
+        (user_id,)
     ).fetchone()
-    c.close()
+    con.close()
 
-    return bool(r)
-def activity(uid,a,d=""):
-    c=conn(); c.execute("INSERT INTO activity_logs(actor_id,action,details,created_at) VALUES(?,?,?,?)",(uid,a,d,now())); c.commit(); c.close()
-def setting(k,d="0"):
-    c=conn(); r=c.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone(); c.close(); return r["value"] if r else d
-def setsetting(k,v):
-    c=conn(); c.execute("INSERT OR REPLACE INTO settings VALUES(?,?)",(k,str(v))); c.commit(); c.close()
+    return bool(row and row[0])
 
-def main_kb():
-    return ReplyKeyboardMarkup([[KeyboardButton("📝 Apply / Request"),KeyboardButton("🎫 Create Ticket")],
-                                [KeyboardButton("📋 My Requests"),KeyboardButton("🎫 My Tickets")],
-                                [KeyboardButton("👤 My Profile")]],resize_keyboard=True)
 
-def admin_kb():
+def register_user(user):
+    con = db()
+
+    existing = con.execute(
+        "SELECT user_id FROM users WHERE user_id=?",
+        (user.id,)
+    ).fetchone()
+
+    if existing:
+        con.execute("""
+            UPDATE users
+            SET username=?,
+                first_name=?,
+                last_name=?,
+                last_active=?
+            WHERE user_id=?
+        """, (
+            user.username,
+            user.first_name,
+            user.last_name,
+            now(),
+            user.id,
+        ))
+    else:
+        con.execute("""
+            INSERT INTO users
+            (
+                user_id,
+                username,
+                first_name,
+                last_name,
+                joined_at,
+                last_active
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+            now(),
+            now(),
+        ))
+
+    con.commit()
+    con.close()
+
+
+def log_activity(user_id, action, code_id=None, details=""):
+    con = db()
+
+    con.execute("""
+        INSERT INTO activity_logs
+        (user_id, action, code_id, details, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        action,
+        code_id,
+        details,
+        now(),
+    ))
+
+    con.commit()
+    con.close()
+
+
+def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Dashboard",callback_data="adm:dash"),InlineKeyboardButton("👥 Users",callback_data="adm:users")],
-        [InlineKeyboardButton("📝 Requests",callback_data="adm:req"),InlineKeyboardButton("🎫 Tickets",callback_data="adm:tickets")],
-        [InlineKeyboardButton("📈 Statistics",callback_data="adm:stats"),InlineKeyboardButton("📋 Activity",callback_data="adm:activity")],
-        [InlineKeyboardButton("🚀 Bot Hosting",callback_data="adm:service:hosting"),InlineKeyboardButton("🔐 Private Chat Bot",callback_data="adm:service:private")],
-        [InlineKeyboardButton("📢 Broadcast",callback_data="adm:broadcast"),InlineKeyboardButton("⚙️ Settings",callback_data="adm:settings")]
+        [
+            InlineKeyboardButton("📤 Upload Code", callback_data="upload"),
+            InlineKeyboardButton("📋 My Codes", callback_data="my_codes"),
+        ],
+        [
+            InlineKeyboardButton("🔎 Get Code", callback_data="get_code"),
+            InlineKeyboardButton("🔗 My Shares", callback_data="my_shares"),
+        ],
+        [
+            InlineKeyboardButton("👤 My Profile", callback_data="profile"),
+            InlineKeyboardButton("📊 Statistics", callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+        ],
     ])
 
-async def start(update,ctx):
-    u=update.effective_user; upsert(u); ctx.user_data.clear()
-    if blocked(u.id): return await update.message.reply_text("🚫 You are blocked.")
-    if setting("maintenance")=="1" and not admin(u.id): return await update.message.reply_text("🛠 Maintenance mode is active.")
-    await update.message.reply_text(f"⚡ KRUTIK CYBER EXPERT\n\nWelcome to Support & Approval Center.\n🆔 Your Chat ID: `{u.id}`",parse_mode="Markdown",reply_markup=main_kb())
 
-async def apply(update,ctx):
-    ctx.user_data["state"]="service"
-    await update.message.reply_text("📝 Select service:",reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Bot Hosting",callback_data="service:hosting")],
-        [InlineKeyboardButton("🔐 Private Chat Bot",callback_data="service:private")],
-        [InlineKeyboardButton("🎫 Other / Custom",callback_data="service:custom")],
-        [InlineKeyboardButton("❌ Cancel",callback_data="cancel")]]))
+# ============================================================
+# START
+# ============================================================
 
-async def service(update,ctx):
-    q=update.callback_query; await q.answer()
-    name={"hosting":"🚀 Bot Hosting","private":"🔐 Private Chat Bot","custom":"🎫 Other / Custom"}[q.data.split(":")[1]]
-    ctx.user_data.update(state="request",service=name)
-    await q.edit_message_text(f"🤖 {name}\n\nRequirement/problem detail bhejo.\n/cancel to cancel.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-async def create_request(update,ctx):
-    u=update.effective_user; text=update.message.text or update.message.caption or f"[{update.message.content_type}]"
-    c=conn(); cur=c.execute("INSERT INTO requests(user_id,service,details,created_at,updated_at) VALUES(?,?,?,?,?)",(u.id,ctx.user_data["service"],text[:4000],now(),now())); rid=cur.lastrowid; c.commit(); c.close()
-    activity(u.id,"create_request",str(rid)); ctx.user_data.clear()
-    await update.message.reply_text(f"🆕 Request #{rid} created.\n⏳ Status: Pending\n\n👑 Admin ko notify kar diya.",reply_markup=main_kb())
-    await ctx.bot.send_message(OWNER_CHAT_ID,f"🆕 NEW REQUEST #{rid}\n\n👤 {u.full_name}\n🔹 @{u.username or 'N/A'}\n🆔 {u.id}\n🤖 {ctx.user_data.get('service','Service')}\n\n📋 {text[:3000]}",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open Request",callback_data=f"req:view:{rid}")]]))
+    user = update.effective_user
+    register_user(user)
 
-async def ticket_start(update,ctx):
-    ctx.user_data["state"]="cat"
-    await update.message.reply_text("🎫 Select category:",reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛠 Technical",callback_data="cat:Technical")],[InlineKeyboardButton("💳 Payment",callback_data="cat:Payment")],
-        [InlineKeyboardButton("📦 Service",callback_data="cat:Service")],[InlineKeyboardButton("🚨 Complaint",callback_data="cat:Complaint")],
-        [InlineKeyboardButton("❓ General",callback_data="cat:General")],[InlineKeyboardButton("❌ Cancel",callback_data="cancel")]]))
+    if user_blocked(user.id):
+        await update.message.reply_text(
+            "🚫 You are blocked from using this bot."
+        )
+        return
 
-async def category(update,ctx):
-    q=update.callback_query; await q.answer(); ctx.user_data.update(state="priority",category=q.data.split(":",1)[1])
-    await q.edit_message_text("🎯 Select priority:",reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Low",callback_data="pri:low")],[InlineKeyboardButton("🟡 Normal",callback_data="pri:normal")],
-        [InlineKeyboardButton("🟠 High",callback_data="pri:high")],[InlineKeyboardButton("🔴 Urgent",callback_data="pri:urgent")]]))
+    # Shared code link
+    if context.args:
+        arg = context.args[0]
 
-async def priority(update,ctx):
-    q=update.callback_query; await q.answer(); ctx.user_data.update(state="subject",priority=q.data.split(":")[1])
-    await q.edit_message_text("📝 Send ticket subject:")
+        if arg.startswith("code_"):
+            token = arg.replace("code_", "", 1)
+            await retrieve_by_token(update, context, token)
+            return
 
-async def ticket_subject(update,ctx):
-    if not update.message.text:return await update.message.reply_text("Please send subject as text.")
-    ctx.user_data.update(state="ticket_message",subject=update.message.text[:300])
-    await update.message.reply_text("💬 Send your problem/details:")
+        if arg.startswith("CODE-"):
+            code_id = arg.upper()
+            await retrieve_by_code_id(update, context, code_id)
+            return
 
-async def create_ticket(update,ctx):
-    u=update.effective_user; text=update.message.text or update.message.caption or f"[{update.message.content_type}]"
-    c=conn(); cur=c.execute("INSERT INTO tickets(user_id,category,priority,subject,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-        (u.id,ctx.user_data["category"],ctx.user_data["priority"],ctx.user_data["subject"],now(),now())); tid=cur.lastrowid
-    c.execute("INSERT INTO ticket_messages(ticket_id,sender_id,sender_type,message_type,text,telegram_message_id,created_at) VALUES(?,?,?,?,?,?,?)",
-        (tid,u.id,"user",update.message.content_type,text[:4000],update.message.message_id,now())); c.commit(); c.close()
-    activity(u.id,"create_ticket",str(tid)); cat=ctx.user_data["category"]; pri=ctx.user_data["priority"]; sub=ctx.user_data["subject"]; ctx.user_data.clear()
-    await update.message.reply_text(f"🎫 #TK-{tid:04d} created!\n📂 {cat}\n🎯 {pri.title()}\n🟢 Open",reply_markup=main_kb())
-    await ctx.bot.send_message(OWNER_CHAT_ID,f"🎫 NEW TICKET #TK-{tid:04d}\n\n👤 {u.full_name}\n🆔 {u.id}\n📂 {cat}\n🎯 {pri.upper()}\n📝 {sub}\n\n💬 {text[:2500]}",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Reply",callback_data=f"reply:{tid}"),InlineKeyboardButton("🔒 Close",callback_data=f"ticket:close:{tid}")]]))
+    text = (
+        "💻 *Code Save and Share*\n\n"
+        "Save your code files and share them with anyone "
+        "through Telegram.\n\n"
+        f"👑 Owner {OWNER_USERNAME}"
+    )
 
-async def my_requests(update,ctx):
-    c=conn(); rows=c.execute("SELECT * FROM requests WHERE user_id=? ORDER BY id DESC LIMIT 20",(update.effective_user.id,)).fetchall(); c.close()
-    await update.message.reply_text("📋 MY REQUESTS\n\n"+("".join(f"#{r['id']} | {r['service']} | {r['status']}\n" for r in rows) or "No requests."))
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=main_menu(),
+    )
 
-async def my_tickets(update,ctx):
-    c=conn(); rows=c.execute("SELECT * FROM tickets WHERE user_id=? ORDER BY id DESC LIMIT 20",(update.effective_user.id,)).fetchall(); c.close()
-    if not rows:return await update.message.reply_text("🎫 No tickets.")
-    for t in rows:
-        await update.message.reply_text(f"🎫 #TK-{t['id']:04d}\n📝 {t['subject']}\n📂 {t['category']}\n🎯 {t['priority'].title()}\n📌 {t['status']}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open",callback_data=f"ticket:view:{t['id']}")],
-                                                [InlineKeyboardButton("🔒 Close",callback_data=f"ticket:close:{t['id']}")]]))
 
-async def profile(update,ctx):
-    u=update.effective_user; c=conn()
-    r=c.execute("SELECT COUNT(*) n FROM requests WHERE user_id=?",(u.id,)).fetchone()["n"]; t=c.execute("SELECT COUNT(*) n FROM tickets WHERE user_id=?",(u.id,)).fetchone()["n"]; c.close()
-    await update.message.reply_text(f"👤 MY PROFILE\n\n📛 {u.full_name}\n🔹 @{u.username or 'N/A'}\n🆔 {u.id}\n📝 Requests: {r}\n🎫 Tickets: {t}")
+# ============================================================
+# BUTTON HANDLER
+# ============================================================
 
-async def admin(update,ctx):
-    if not admin(update.effective_user.id):return await update.message.reply_text("🚫 Admin only.")
-    await update.message.reply_text("👑 KRUTIK ADMIN PANEL",reply_markup=admin_kb())
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-async def adm_cb(update,ctx):
-    q=update.callback_query
-    if not admin(q.from_user.id):return await q.answer("🚫 Admin only.",show_alert=True)
-    await q.answer(); d=q.data
-    if d=="adm:dash":
-        c=conn(); vals=[c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],c.execute("SELECT COUNT(*) n FROM requests WHERE status='pending'").fetchone()["n"],c.execute("SELECT COUNT(*) n FROM tickets WHERE status='open'").fetchone()["n"],c.execute("SELECT COUNT(*) n FROM tickets WHERE status='open' AND priority='urgent'").fetchone()["n"]]; c.close()
-        return await q.edit_message_text(f"📊 DASHBOARD\n\n👥 Users: {vals[0]}\n📝 Pending Requests: {vals[1]}\n🎫 Open Tickets: {vals[2]}\n🔴 Urgent: {vals[3]}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back",callback_data="adm:home")]]))
-    if d=="adm:home":return await q.edit_message_text("👑 ADMIN PANEL",reply_markup=admin_kb())
-    if d=="adm:users":
-        c=conn(); rows=c.execute("SELECT * FROM users ORDER BY last_active DESC LIMIT 25").fetchall(); c.close()
-        text="👥 USERS\n\n"+"".join(f"👤 {r['name']} | 🆔 {r['user_id']} | {'🚫' if r['blocked'] else '🟢'}\n" for r in rows)
-        return await q.edit_message_text(text[:4000],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back",callback_data="adm:home")]]))
-    if d=="adm:req":
-        c=conn(); rows=c.execute("SELECT * FROM requests ORDER BY id DESC LIMIT 25").fetchall(); c.close()
-        return await q.edit_message_text("📝 REQUESTS\n\n"+("".join(f"#{r['id']} | {r['service']} | {r['status']} | User {r['user_id']}\n" for r in rows) or "No requests."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back",callback_data="adm:home")]]))
-    if d=="adm:tickets":
-        c=conn(); rows=c.execute("SELECT * FROM tickets ORDER BY id DESC LIMIT 25").fetchall(); c.close()
-        return await q.edit_message_text("🎫 TICKETS\n\n"+("".join(f"#TK-{r['id']:04d} | {r['priority']} | {r['status']} | User {r['user_id']}\n" for r in rows) or "No tickets."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back",callback_data="adm:home")]]))
-    if d=="adm:stats":
-        c=conn(); a=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]; b=c.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"]; t=c.execute("SELECT COUNT(*) n FROM tickets").fetchone()["n"]; cl=c.execute("SELECT COUNT(*) n FROM tickets WHERE status='closed'").fetchone()["n"]; c.close()
-        return await q.edit_message_text(f"📈 STATISTICS\n\n👥 Users: {a}\n📝 Requests: {b}\n🎫 Tickets: {t}\n✅ Closed: {cl}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back",callback_data="adm:home")]]))
-    if d=="adm:activity":
-        c=conn(); rows=c.execute("SELECT * FROM activity_logs ORDER BY id DESC LIMIT 20").fetchall(); c.close()
-        return await q.edit_message_text("📋 ACTIVITY\n\n"+"".join(f"#{r['id']} {r['action']} | {r['actor_id']}\n" for r in rows),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back",callback_data="adm:home")]]))
-    if d=="adm:settings":
-        return await q.edit_message_text(f"⚙️ Maintenance: {'ON' if setting('maintenance')=='1' else 'OFF'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Toggle Maintenance",callback_data="adm:maint")],[InlineKeyboardButton("⬅️ Back",callback_data="adm:home")]]))
-    if d=="adm:maint":
-        setsetting("maintenance","0" if setting("maintenance")=="1" else "1"); return await q.edit_message_text("⚙️ Setting updated.",reply_markup=admin_kb())
-    if d=="adm:broadcast":
-        ctx.user_data["state"]="broadcast"; return await q.edit_message_text("📢 Send broadcast message. /cancel to cancel.")
-    if d.startswith("adm:service:"):
-        service="🚀 Bot Hosting" if d.endswith("hosting") else "🔐 Private Chat Bot"; c=conn(); rows=c.execute("SELECT * FROM requests WHERE service=? ORDER BY id DESC LIMIT 20",(service,)).fetchall(); c.close()
-        return await q.edit_message_text(f"{service}\n\n"+"".join(f"#{r['id']} | User {r['user_id']} | {r['status']}\n" for r in rows) or "No requests.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back",callback_data="adm:home")]]))
+    query = update.callback_query
+    await query.answer()
 
-async def req_cb(update,ctx):
-    q=update.callback_query; await q.answer()
-    if not admin(q.from_user.id, context):
-    return
-    _,action,rid=q.data.split(":"); rid=int(rid); c=conn(); r=c.execute("SELECT * FROM requests WHERE id=?",(rid,)).fetchone()
-    if not r:return await q.edit_message_text("Request not found.")
-    if action=="view":
-        return await q.edit_message_text(f"📝 REQUEST #{rid}\n\n👤 {r['user_id']}\n🤖 {r['service']}\n📌 {r['status']}\n\n{r['details']}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"req:approve:{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"req:reject:{rid}")],[InlineKeyboardButton("🎫 Create Ticket",callback_data=f"req:ticket:{rid}")]]))
-    if action=="approve":
-        c.execute("UPDATE requests SET status='approved',updated_at=? WHERE id=?",(now(),rid));c.commit();c.close()
-        await ctx.bot.send_message(r["user_id"],f"🎉 Request #{rid} approved!\n🤖 {r['service']}");return await q.edit_message_text(f"✅ Request #{rid} approved.")
-    if action=="reject":
-        c.close();ctx.user_data.update(state="reject",rid=rid);return await q.message.reply_text(f"❌ Send rejection reason for #{rid}:")
-    if action=="ticket":
-        c.execute("INSERT INTO tickets(user_id,category,priority,subject,created_at,updated_at) VALUES(?,?,?,?,?,?)",(r["user_id"],r["service"],"normal",f"Request #{rid}",now(),now()));tid=c.execute("SELECT last_insert_rowid()").fetchone()[0];c.execute("UPDATE requests SET status='ticket_created',updated_at=? WHERE id=?",(now(),rid));c.commit();c.close()
-        await ctx.bot.send_message(r["user_id"],f"🎫 Ticket #TK-{tid:04d} created from request #{rid}.");return await q.edit_message_text(f"🎫 Ticket #TK-{tid:04d} created.")
+    user = query.from_user
+    register_user(user)
 
-async def ticket_cb(update,ctx):
-    q=update.callback_query; await q.answer(); p=q.data.split(":"); action=p[1];tid=int(p[2]);c=conn();t=c.execute("SELECT * FROM tickets WHERE id=?",(tid,)).fetchone()
-    if not t:return
-    if not admin(q.from_user.id) and t["user_id"]!=q.from_user.id:return
-    if action in ("view","open"):
-        rows=c.execute("SELECT * FROM ticket_messages WHERE ticket_id=? ORDER BY id ASC LIMIT 40",(tid,)).fetchall();c.close()
-        text=f"🎫 #TK-{tid:04d}\n📝 {t['subject']}\n📂 {t['category']}\n🎯 {t['priority'].title()}\n📌 {t['status']}\n\n"+"".join(("👑 Admin" if r["sender_type"]=="admin" else "👤 User")+f": {r['text']}\n\n" for r in rows)
-        buttons=[[InlineKeyboardButton("💬 Reply",callback_data=f"reply:{tid}")]]
-        if t["status"]=="closed":buttons.append([InlineKeyboardButton("🔄 Reopen",callback_data=f"ticket:reopen:{tid}")])
-        else:buttons.append([InlineKeyboardButton("🔒 Close",callback_data=f"ticket:close:{tid}")])
-        return await q.edit_message_text(text[:4000],reply_markup=InlineKeyboardMarkup(buttons))
-    if action in ("close","reopen"):
-        new="closed" if action=="close" else "open";c.execute("UPDATE tickets SET status=?,updated_at=? WHERE id=?",(new,now(),tid));c.commit();c.close()
-        await ctx.bot.send_message(t["user_id"],f"{'🔒 Closed' if new=='closed' else '🔄 Reopened'}: #TK-{tid:04d}")
-        return await q.edit_message_text(f"{'🔒 Closed' if new=='closed' else '🔄 Reopened'} #TK-{tid:04d}")
+    if user_blocked(user.id):
+        await query.edit_message_text(
+            "🚫 You are blocked from using this bot."
+        )
+        return
 
-async def reply_cb(update,ctx):
-    q=update.callback_query;await q.answer()
-    if not admin(q.from_user.id):return
-    tid=int(q.data.split(":")[1]);ctx.user_data.update(state="reply",tid=tid);await q.message.reply_text(f"💬 Send reply for #TK-{tid:04d}.")
+    data = query.data
 
-async def broadcast(update,ctx):
-    text=update.message.text or update.message.caption or f"[{update.message.content_type}]";c=conn();users=c.execute("SELECT user_id FROM users WHERE blocked=0").fetchall();c.close();sent=fail=0
-    for r in users:
-        try:await update.message.copy(chat_id=r["user_id"]);sent+=1
-        except Exception:fail+=1
-        await asyncio.sleep(.03)
-    ctx.user_data.clear();await update.message.reply_text(f"📢 Done\n✅ {sent}\n❌ {fail}")
+    if data == "upload":
 
-async def router(update,ctx):
-    if not update.message:return
-    u=update.effective_user;upsert(u)
-    if blocked(u.id):return await update.message.reply_text("🚫 You are blocked.")
-    state=ctx.user_data.get("state")
-    if state=="request":return await create_request(update,ctx)
-    if state=="ticket_subject":return await ticket_subject(update,ctx)
-    if state=="ticket_message":return await create_ticket(update,ctx)
-    if state=="reply" and admin(u.id):
-        tid=ctx.user_data["tid"];text=update.message.text or update.message.caption or f"[{update.message.content_type}]";c=conn();t=c.execute("SELECT * FROM tickets WHERE id=?",(tid,)).fetchone();c.execute("INSERT INTO ticket_messages(ticket_id,sender_id,sender_type,message_type,text,telegram_message_id,created_at) VALUES(?,?,?,?,?,?,?)",(tid,u.id,"admin",update.message.content_type,text[:4000],update.message.message_id,now()));c.execute("UPDATE tickets SET status='open',updated_at=? WHERE id=?",(now(),tid));c.commit();c.close();ctx.user_data.clear();await ctx.bot.send_message(t["user_id"],f"💬 Admin replied on #TK-{tid:04d}:\n\n{text[:3500]}");return await update.message.reply_text("✅ Reply sent.")
-    if state=="reject" and admin(u.id):
-        rid=ctx.user_data["rid"];reason=update.message.text or update.message.caption or "No reason";c=conn();r=c.execute("SELECT * FROM requests WHERE id=?",(rid,)).fetchone();c.execute("UPDATE requests SET status='rejected',reason=?,updated_at=? WHERE id=?",(reason[:2000],now(),rid));c.commit();c.close();ctx.user_data.clear();await ctx.bot.send_message(r["user_id"],f"❌ Request #{rid} rejected.\n\nReason: {reason[:2000]}");return await update.message.reply_text("❌ Rejected.")
-    if state=="broadcast" and admin(u.id):return await broadcast(update,ctx)
-    if update.message.text=="📝 Apply / Request":return await apply(update,ctx)
-    if update.message.text=="🎫 Create Ticket":return await ticket_start(update,ctx)
-    if update.message.text=="📋 My Requests":return await my_requests(update,ctx)
-    if update.message.text=="🎫 My Tickets":return await my_tickets(update,ctx)
-    if update.message.text=="👤 My Profile":return await profile(update,ctx)
-    if is_admin(u.id):await update.message.reply_text("👑 Use /admin for admin panel.")
-    else:await update.message.reply_text("Main menu se option select karo.",reply_markup=main_kb())
+        context.user_data["state"] = "waiting_file"
 
-async def cancel(update,ctx):
-    ctx.user_data.clear();await update.message.reply_text("❌ Cancelled.",reply_markup=main_kb())
+        await query.edit_message_text(
+            "📤 *Upload Code*\n\n"
+            "Send your code file now.\n\n"
+            "Supported examples:\n"
+            "`.py` `.js` `.html` `.css` `.json` `.java` `.cpp` `.php` `.txt`\n\n"
+            "❌ /cancel to cancel",
+            parse_mode="Markdown",
+        )
+
+    elif data == "my_codes":
+        await show_my_codes(query, user.id)
+
+    elif data == "get_code":
+
+        context.user_data["state"] = "waiting_code_id"
+
+        await query.edit_message_text(
+            "🔎 Send Code ID.\n\n"
+            "Example:\n"
+            "`CODE-1001`",
+            parse_mode="Markdown",
+        )
+
+    elif data == "my_shares":
+        await show_my_shares(query, user.id)
+
+    elif data == "profile":
+        await show_profile(query, user.id)
+
+    elif data == "stats":
+        await show_stats(query, user.id)
+
+    elif data == "help":
+        await query.edit_message_text(
+            "ℹ️ *How it works*\n\n"
+            "1️⃣ Upload your code file.\n"
+            "2️⃣ Bot stores it in the private Telegram storage channel.\n"
+            "3️⃣ Bot creates a Code ID and share link.\n"
+            "4️⃣ Share the Telegram link with anyone.\n"
+            "5️⃣ They open it and receive the file.\n\n"
+            f"👑 Owner {OWNER_USERNAME}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="home")]
+            ]),
+        )
+
+    elif data == "home":
+        await query.edit_message_text(
+            "💻 *Code Save and Share*\n\n"
+            f"👑 Owner {OWNER_USERNAME}",
+            parse_mode="Markdown",
+            reply_markup=main_menu(),
+        )
+
+
+# ============================================================
+# TEXT / FILE ROUTER
+# ============================================================
+
+async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+    register_user(user)
+
+    if user_blocked(user.id):
+        await update.message.reply_text(
+            "🚫 You are blocked from using this bot."
+        )
+        return
+
+    state = context.user_data.get("state")
+
+    if state == "waiting_file":
+
+        if not update.message.document:
+            await update.message.reply_text(
+                "❌ Please send a code file/document."
+            )
+            return
+
+        await process_upload(update, context)
+        return
+
+    if state == "waiting_title":
+
+        title = update.message.text.strip()
+
+        if not title:
+            await update.message.reply_text(
+                "❌ Title cannot be empty."
+            )
+            return
+
+        context.user_data["title"] = title
+        context.user_data["state"] = "waiting_description"
+
+        await update.message.reply_text(
+            "📝 Send a description.\n\n"
+            "Or send `skip`."
+        )
+        return
+
+    if state == "waiting_description":
+
+        description = update.message.text.strip()
+
+        if description.lower() == "skip":
+            description = ""
+
+        context.user_data["description"] = description
+        context.user_data["state"] = "waiting_language"
+
+        await update.message.reply_text(
+            "🏷️ Enter programming language.\n\n"
+            "Example: `Python`\n\n"
+            "Or send `auto`."
+        )
+        return
+
+    if state == "waiting_language":
+
+        language = update.message.text.strip()
+
+        if language.lower() == "auto":
+            language = detect_language(
+                context.user_data.get("file_name", "")
+            )
+
+        context.user_data["language"] = language
+
+        await finish_upload(update, context)
+        return
+
+    if state == "waiting_code_id":
+
+        code_id = update.message.text.strip().upper()
+
+        await retrieve_by_code_id(update, context, code_id)
+
+        context.user_data.clear()
+        return
+
+    await update.message.reply_text(
+        "👇 Please use the menu.",
+        reply_markup=main_menu(),
+    )
+
+
+# ============================================================
+# UPLOAD
+# ============================================================
+
+async def process_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    document = update.message.document
+
+    if document.file_size and document.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text(
+            "❌ File is too large.\n"
+            "Maximum allowed size is 50 MB."
+        )
+        return
+
+    if not STORAGE_CHANNEL_ID:
+        await update.message.reply_text(
+            "❌ Storage channel is not configured.\n\n"
+            "Owner needs to set STORAGE_CHANNEL_ID."
+        )
+        return
+
+    try:
+
+        storage_chat_id = int(STORAGE_CHANNEL_ID)
+
+        sent = await context.bot.send_document(
+            chat_id=storage_chat_id,
+            document=document.file_id,
+            caption=(
+                "💻 Code Save and Share\n\n"
+                f"File: {document.file_name}\n"
+                f"Uploader ID: {update.effective_user.id}\n"
+                f"Time: {now()}\n"
+            ),
+        )
+
+        context.user_data["storage_message_id"] = sent.message_id
+        context.user_data["storage_chat_id"] = str(storage_chat_id)
+        context.user_data["file_name"] = document.file_name or "code"
+
+        context.user_data["state"] = "waiting_title"
+
+        await update.message.reply_text(
+            "✅ File received and securely stored.\n\n"
+            "📝 Now send a title for your code."
+        )
+
+    except Exception as e:
+
+        logger.exception("Storage upload failed")
+
+        await update.message.reply_text(
+            "❌ Upload failed.\n\n"
+            "Please check that the bot is an administrator "
+            "of the private storage channel."
+        )
+
+
+# ============================================================
+# FINISH UPLOAD
+# ============================================================
+
+async def finish_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    title = context.user_data.get("title", "Untitled")
+    description = context.user_data.get("description", "")
+    language = context.user_data.get("language", "")
+    file_name = context.user_data.get("file_name", "code")
+    storage_chat_id = context.user_data.get("storage_chat_id")
+    storage_message_id = context.user_data.get("storage_message_id")
+
+    code_id = create_code_id()
+
+    con = db()
+
+    con.execute("""
+        INSERT INTO codes
+        (
+            code_id,
+            user_id,
+            title,
+            description,
+            language,
+            file_name,
+            file_size,
+            storage_chat_id,
+            storage_message_id,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        code_id,
+        user.id,
+        title,
+        description,
+        language,
+        file_name,
+        0,
+        storage_chat_id,
+        storage_message_id,
+        now(),
+        now(),
+    ))
+
+    token = secrets.token_urlsafe(16)
+
+    con.execute("""
+        INSERT INTO share_links
+        (
+            code_id,
+            token,
+            created_by,
+            created_at
+        )
+        VALUES (?, ?, ?, ?)
+    """, (
+        code_id,
+        token,
+        user.id,
+        now(),
+    ))
+
+    con.commit()
+    con.close()
+
+    log_activity(
+        user.id,
+        "UPLOAD_CODE",
+        code_id,
+        file_name,
+    )
+
+    bot_username = context.bot.username
+
+    share_link = (
+        f"https://t.me/{bot_username}?start=code_{token}"
+    )
+
+    context.user_data.clear()
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔗 Share Code",
+                url=share_link
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 My Codes",
+                callback_data="my_codes"
+            )
+        ],
+    ])
+
+    await update.message.reply_text(
+        "✅ *Code Saved Successfully!*\n\n"
+        f"🆔 Code ID: `{code_id}`\n"
+        f"📄 File: `{file_name}`\n"
+        f"🏷️ Language: `{language}`\n\n"
+        "🔗 Share this code using the button below.\n\n"
+        f"👑 Owner {OWNER_USERNAME}",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+def create_code_id():
+
+    con = db()
+
+    row = con.execute(
+        "SELECT COUNT(*) FROM codes"
+    ).fetchone()
+
+    con.close()
+
+    number = (row[0] if row else 0) + 1001
+
+    return f"CODE-{number}"
+
+
+def detect_language(filename):
+
+    ext = os.path.splitext(filename.lower())[1]
+
+    languages = {
+        ".py": "Python",
+        ".js": "JavaScript",
+        ".ts": "TypeScript",
+        ".html": "HTML",
+        ".css": "CSS",
+        ".json": "JSON",
+        ".java": "Java",
+        ".cpp": "C++",
+        ".c": "C",
+        ".php": "PHP",
+        ".go": "Go",
+        ".rs": "Rust",
+        ".rb": "Ruby",
+        ".kt": "Kotlin",
+        ".swift": "Swift",
+        ".txt": "Text",
+    }
+
+    return languages.get(ext, "Unknown")
+
+
+# ============================================================
+# RETRIEVE
+# ============================================================
+
+async def retrieve_by_token(update, context, token):
+
+    con = db()
+
+    row = con.execute("""
+        SELECT
+            c.code_id,
+            c.user_id,
+            c.title,
+            c.description,
+            c.language,
+            c.file_name,
+            c.storage_chat_id,
+            c.storage_message_id,
+            s.used_count,
+            s.max_uses,
+            s.is_active
+        FROM share_links s
+        JOIN codes c ON c.code_id=s.code_id
+        WHERE s.token=?
+          AND c.is_deleted=0
+    """, (token,)).fetchone()
+
+    if not row:
+        con.close()
+
+        await update.message.reply_text(
+            "❌ This share link is invalid or expired."
+        )
+        return
+
+    (
+        code_id,
+        owner_id,
+        title,
+        description,
+        language,
+        file_name,
+        storage_chat_id,
+        storage_message_id,
+        used_count,
+        max_uses,
+        is_active,
+    ) = row
+
+    if not is_active:
+        con.close()
+
+        await update.message.reply_text(
+            "🚫 This share link has been disabled."
+        )
+        return
+
+    if max_uses and used_count >= max_uses:
+        con.close()
+
+        await update.message.reply_text(
+            "🚫 This share link has reached its usage limit."
+        )
+        return
+
+    con.execute("""
+        UPDATE share_links
+        SET used_count=used_count+1
+        WHERE token=?
+    """, (token,))
+
+    con.execute("""
+        INSERT INTO retrievals
+        (code_id, share_token, user_id, retrieved_at)
+        VALUES (?, ?, ?, ?)
+    """, (
+        code_id,
+        token,
+        update.effective_user.id,
+        now(),
+    ))
+
+    con.commit()
+    con.close()
+
+    log_activity(
+        update.effective_user.id,
+        "RETRIEVE_CODE",
+        code_id,
+        file_name,
+    )
+
+    await send_storage_file(
+        update,
+        context,
+        code_id,
+        title,
+        description,
+        language,
+        file_name,
+        storage_chat_id,
+        storage_message_id,
+    )
+
+
+async def retrieve_by_code_id(update, context, code_id):
+
+    con = db()
+
+    row = con.execute("""
+        SELECT
+            code_id,
+            user_id,
+            title,
+            description,
+            language,
+            file_name,
+            storage_chat_id,
+            storage_message_id
+        FROM codes
+        WHERE code_id=?
+          AND is_deleted=0
+    """, (code_id,)).fetchone()
+
+    con.close()
+
+    if not row:
+        await update.message.reply_text(
+            "❌ Code not found."
+        )
+        return
+
+    (
+        code_id,
+        owner_id,
+        title,
+        description,
+        language,
+        file_name,
+        storage_chat_id,
+        storage_message_id,
+    ) = row
+
+    log_activity(
+        update.effective_user.id,
+        "RETRIEVE_CODE_ID",
+        code_id,
+        file_name,
+    )
+
+    await send_storage_file(
+        update,
+        context,
+        code_id,
+        title,
+        description,
+        language,
+        file_name,
+        storage_chat_id,
+        storage_message_id,
+    )
+
+
+async def send_storage_file(
+    update,
+    context,
+    code_id,
+    title,
+    description,
+    language,
+    file_name,
+    storage_chat_id,
+    storage_message_id,
+):
+
+    try:
+
+        await context.bot.copy_message(
+            chat_id=update.effective_chat.id,
+            from_chat_id=int(storage_chat_id),
+            message_id=int(storage_message_id),
+        )
+
+        await update.message.reply_text(
+            "💻 *Code Information*\n\n"
+            f"🆔 `{code_id}`\n"
+            f"📝 {title}\n"
+            f"📄 `{file_name}`\n"
+            f"🏷️ {language}\n"
+            + (
+                f"\n📖 {description}\n"
+                if description
+                else ""
+            )
+            + f"\n👑 Owner {OWNER_USERNAME}",
+            parse_mode="Markdown",
+        )
+
+    except Exception:
+
+        logger.exception("Failed to copy storage message")
+
+        await update.message.reply_text(
+            "❌ Unable to retrieve this file right now."
+        )
+
+
+# ============================================================
+# MY CODES
+# ============================================================
+
+async def show_my_codes(query, user_id):
+
+    con = db()
+
+    rows = con.execute("""
+        SELECT code_id, title, file_name, language
+        FROM codes
+        WHERE user_id=?
+          AND is_deleted=0
+        ORDER BY id DESC
+        LIMIT 50
+    """, (user_id,)).fetchall()
+
+    con.close()
+
+    if not rows:
+
+        await query.edit_message_text(
+            "📋 *My Codes*\n\n"
+            "You have not uploaded any codes yet.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="home"
+                )]
+            ]),
+        )
+        return
+
+    text = "📋 *MY CODES*\n\n"
+
+    buttons = []
+
+    for code_id, title, file_name, language in rows:
+
+        text += (
+            f"🆔 `{code_id}`\n"
+            f"📝 {title}\n"
+            f"📄 {file_name}\n"
+            f"🏷️ {language}\n\n"
+        )
+
+        buttons.append([
+            InlineKeyboardButton(
+                f"📥 {code_id}",
+                callback_data=f"view_{code_id}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🔙 Back",
+            callback_data="home"
+        )
+    ])
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ============================================================
+# CODE VIEW
+# ============================================================
+
+async def view_code(update, context):
+
+    query = update.callback_query
+    await query.answer()
+
+    code_id = query.data.replace("view_", "", 1)
+
+    con = db()
+
+    row = con.execute("""
+        SELECT
+            code_id,
+            user_id,
+            title,
+            description,
+            language,
+            file_name,
+            storage_chat_id,
+            storage_message_id
+        FROM codes
+        WHERE code_id=?
+          AND is_deleted=0
+    """, (code_id,)).fetchone()
+
+    con.close()
+
+    if not row:
+        await query.edit_message_text(
+            "❌ Code not found."
+        )
+        return
+
+    (
+        code_id,
+        owner_id,
+        title,
+        description,
+        language,
+        file_name,
+        storage_chat_id,
+        storage_message_id,
+    ) = row
+
+    if owner_id != query.from_user.id:
+        await query.edit_message_text(
+            "🚫 This code does not belong to you."
+        )
+        return
+
+    bot_username = context.bot.username
+
+    con = db()
+
+    share = con.execute("""
+        SELECT token
+        FROM share_links
+        WHERE code_id=?
+          AND is_active=1
+        ORDER BY id DESC
+        LIMIT 1
+    """, (code_id,)).fetchone()
+
+    con.close()
+
+    if share:
+        link = f"https://t.me/{bot_username}?start=code_{share[0]}"
+    else:
+        link = None
+
+    buttons = []
+
+    if link:
+        buttons.append([
+            InlineKeyboardButton(
+                "🔗 Share Code",
+                url=link
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "📋 My Codes",
+            callback_data="my_codes"
+        )
+    ])
+
+    await query.edit_message_text(
+        "💻 *CODE DETAILS*\n\n"
+        f"🆔 `{code_id}`\n"
+        f"📝 {title}\n"
+        f"📄 `{file_name}`\n"
+        f"🏷️ {language}\n"
+        + (
+            f"📖 {description}\n"
+            if description
+            else ""
+        ),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ============================================================
+# MY SHARES
+# ============================================================
+
+async def show_my_shares(query, user_id):
+
+    con = db()
+
+    rows = con.execute("""
+        SELECT
+            s.code_id,
+            s.used_count,
+            s.max_uses,
+            s.is_active
+        FROM share_links s
+        WHERE s.created_by=?
+        ORDER BY s.id DESC
+        LIMIT 50
+    """, (user_id,)).fetchall()
+
+    con.close()
+
+    if not rows:
+
+        await query.edit_message_text(
+            "🔗 *My Share Links*\n\n"
+            "No share links yet.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="home"
+                )]
+            ]),
+        )
+        return
+
+    text = "🔗 *MY SHARE LINKS*\n\n"
+
+    for code_id, used, max_uses, active in rows:
+
+        status = "🟢 Active" if active else "🔴 Disabled"
+
+        limit = (
+            "♾️ Unlimited"
+            if not max_uses
+            else f"{max_uses} uses"
+        )
+
+        text += (
+            f"🆔 `{code_id}`\n"
+            f"{status}\n"
+            f"📥 Retrieves: {used}\n"
+            f"🔢 Limit: {limit}\n\n"
+        )
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="home"
+            )]
+        ]),
+    )
+
+
+# ============================================================
+# PROFILE
+# ============================================================
+
+async def show_profile(query, user_id):
+
+    con = db()
+
+    user = con.execute("""
+        SELECT username, first_name, last_name, joined_at
+        FROM users
+        WHERE user_id=?
+    """, (user_id,)).fetchone()
+
+    codes = con.execute("""
+        SELECT COUNT(*)
+        FROM codes
+        WHERE user_id=?
+          AND is_deleted=0
+    """, (user_id,)).fetchone()[0]
+
+    shares = con.execute("""
+        SELECT COUNT(*)
+        FROM share_links
+        WHERE created_by=?
+    """, (user_id,)).fetchone()[0]
+
+    retrieves = con.execute("""
+        SELECT COUNT(*)
+        FROM retrievals
+        WHERE user_id=?
+    """, (user_id,)).fetchone()[0]
+
+    con.close()
+
+    username = (
+        f"@{user[0]}"
+        if user and user[0]
+        else "Not set"
+    )
+
+    first_name = user[1] if user else "Unknown"
+
+    await query.edit_message_text(
+        "👤 *MY PROFILE*\n\n"
+        f"Name: {first_name}\n"
+        f"Username: {username}\n"
+        f"ID: `{user_id}`\n\n"
+        f"💻 Codes: {codes}\n"
+        f"🔗 Shares: {shares}\n"
+        f"📥 Retrieves: {retrieves}\n\n"
+        f"👑 Owner {OWNER_USERNAME}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="home"
+            )]
+        ]),
+    )
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+async def show_stats(query, user_id):
+
+    con = db()
+
+    codes = con.execute("""
+        SELECT COUNT(*)
+        FROM codes
+        WHERE user_id=?
+          AND is_deleted=0
+    """, (user_id,)).fetchone()[0]
+
+    shares = con.execute("""
+        SELECT COUNT(*)
+        FROM share_links
+        WHERE created_by=?
+    """, (user_id,)).fetchone()[0]
+
+    retrieves = con.execute("""
+        SELECT COUNT(*)
+        FROM retrievals r
+        JOIN codes c ON c.code_id=r.code_id
+        WHERE c.user_id=?
+    """, (user_id,)).fetchone()[0]
+
+    con.close()
+
+    await query.edit_message_text(
+        "📊 *MY STATISTICS*\n\n"
+        f"💻 Total Codes: {codes}\n"
+        f"🔗 Total Share Links: {shares}\n"
+        f"📥 Total Retrieves: {retrieves}\n\n"
+        f"👑 Owner {OWNER_USERNAME}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="home"
+            )]
+        ]),
+    )
+
+
+# ============================================================
+# CANCEL
+# ============================================================
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "❌ Cancelled.",
+        reply_markup=main_menu(),
+    )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(update, context):
+
+    logger.exception(
+        "Unhandled error: %s",
+        context.error,
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    init_db();Thread(target=run_web,daemon=True).start()
-    app=Application.builder().token(BOT_TOKEN).build()
-    for cmd,fn in [("start",start),("admin",admin),("cancel",cancel)]:
-        app.add_handler(CommandHandler(cmd,fn))
-    app.add_handler(CommandHandler("approve",lambda u,c: u.message.reply_text("Use Admin Panel to approve requests.")))
-    app.add_handler(CallbackQueryHandler(service,pattern=r"^service:"))
-    app.add_handler(CallbackQueryHandler(category,pattern=r"^cat:"))
-    app.add_handler(CallbackQueryHandler(priority,pattern=r"^pri:"))
-    app.add_handler(CallbackQueryHandler(adm_cb,pattern=r"^adm:"))
-    app.add_handler(CallbackQueryHandler(req_cb,pattern=r"^req:"))
-    app.add_handler(CallbackQueryHandler(ticket_cb,pattern=r"^ticket:"))
-    app.add_handler(CallbackQueryHandler(reply_cb,pattern=r"^reply:"))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,router))
-    log.info("⚡ KRUTIK CYBER EXPERT Ticket Support Bot started")
-    app.run_polling(drop_pending_updates=True)
 
-if __name__=="__main__":main()
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
+
+    if not STORAGE_CHANNEL_ID:
+        logger.warning(
+            "STORAGE_CHANNEL_ID is not configured."
+        )
+
+    init_db()
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("cancel", cancel)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            buttons,
+            pattern="^(upload|my_codes|get_code|my_shares|profile|stats|help|home)$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            view_code,
+            pattern=r"^view_CODE-\d+$"
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.Document.ALL,
+            message_router
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_router
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    logger.info("Code Save and Share bot started.")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
