@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: krutik-ultimate-bot-hosting
+    name: krutik-ticket-support-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
